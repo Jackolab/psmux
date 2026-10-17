@@ -1361,7 +1361,11 @@ fn expand_var_inner(var: &str, app: &AppState, win_idx: usize) -> String {
     match var {
         // ── Session ──
         "session_name" => app.session_name.clone(),
-        "session_attached" => if app.attached_clients > 0 { "1".into() } else { "0".into() },
+        // tmux semantics: a client COUNT, not a bool — every attached
+        // client (control-mode included) increments it. The 0/1 clamp
+        // made `session_attached - <known watchers>` structurally 0 on
+        // Windows, which is what tenax's `others` reads (#2750).
+        "session_attached" => app.attached_clients.to_string(),
         "session_windows" => app.windows.len().to_string(),
         "session_id" => format!("${}", app.session_id),
         "session_created" => app.created_at.timestamp().to_string(),

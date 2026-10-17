@@ -3290,6 +3290,26 @@ pub fn send_bytes_to_active(app: &mut AppState, bytes: &[u8]) -> io::Result<()> 
     Ok(())
 }
 
+/// feed-pane: `bytes` enter the active pane's terminal parser as OUTPUT,
+/// as if its child had emitted them — the counterpart to
+/// `send_bytes_to_active`'s input direction (tenax #2710). A targeted
+/// request reaches here with its pane focused, so "active" is the target.
+/// `sync_input` does not broadcast: one feed lands on one pane, the way a
+/// real child's output lands on its own parser.
+pub fn feed_output_to_active(app: &mut AppState, bytes: &[u8]) -> io::Result<()> {
+    let win = &mut app.windows[app.active_idx];
+    if let Some(fi) = win.floating_focus {
+        if let Some(fp) = win.floating.get_mut(fi) {
+            crate::pane::feed_pane_output(&fp.pane, bytes);
+            return Ok(());
+        }
+    }
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        crate::pane::feed_pane_output(p, bytes);
+    }
+    Ok(())
+}
+
 pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     // In clock mode, any input exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {

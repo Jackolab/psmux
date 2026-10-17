@@ -560,17 +560,12 @@ fn row_chars(runs: &[crate::layout::CellRunJson], width: usize) -> Vec<char> {
 ///   * Columns are NOT modified here. The caller's render loop already
 ///     clips runs that exceed `inner.width`, so column geometry stays
 ///     pixel-accurate.
-pub(crate) fn downscale_rows_v2(
-    src: &[crate::layout::RowRunsJson],
-    _src_h: u16,
-    _src_w: u16,
-    dst_h: u16,
-    _dst_w: u16,
-) -> Vec<crate::layout::RowRunsJson> {
+/// The `[start, kept)` pane-row window `downscale_rows_v2` draws when a
+/// pane grid is bottom-anchored into `dst_h` screen rows. The post-draw
+/// cursor write must subtract `start` from the pane-local cursor row or
+/// the caret lands `start` rows below the text it belongs to.
+fn downscale_window(src: &[crate::layout::RowRunsJson], dst_h: u16) -> (usize, usize) {
     use crate::layout::RowRunsJson;
-    if dst_h == 0 || src.is_empty() {
-        return Vec::new();
-    }
     // Find the last row that has any non-blank cell (with bg colour or
     // non-space text). Everything after that is empty filler from the
     // viewport.
@@ -590,9 +585,60 @@ pub(crate) fn downscale_rows_v2(
     if last_used < src.len() {
         last_used += 1;
     }
-    let trimmed = &src[..last_used];
-    let start = trimmed.len().saturating_sub(dst_h as usize);
-    trimmed[start..].to_vec()
+    (last_used.saturating_sub(dst_h as usize), last_used)
+}
+
+/// Rows dropped off the top when the active pane's grid is bigger than its
+/// on-screen rect (`window_bigger`): the render bottom-anchors the pane, so
+/// pane row `r` is drawn at `inner.y + r - clip`. `0` when the pane draws
+/// 1:1. `inner` is the active pane's content rect (`pane_content_inner`).
+pub(crate) fn active_pane_clip_offset(node: &LayoutJson, inner: Rect) -> u16 {
+    match node {
+        LayoutJson::Leaf { active, rows, cols, rows_v2, .. } => {
+            if !*active
+                || inner.height == 0
+                || inner.width == 0
+                || (*rows <= inner.height && *cols <= inner.width)
+            {
+                0
+            } else {
+                downscale_window(rows_v2, inner.height).0 as u16
+            }
+        }
+        LayoutJson::Split { children, .. } => children
+            .iter()
+            .map(|c| active_pane_clip_offset(c, inner))
+            .find(|v| *v != 0)
+            .unwrap_or(0),
+    }
+}
+
+/// Pane-local cursor cell → screen position, applying the same top-clip the
+/// content render used. Returns `None` when the pane cursor is outside the
+/// visible band — the honest render is no caret, not one parked on the
+/// wrong row.
+pub(crate) fn clipped_pane_cursor_pos(inner: Rect, clip: u16, cc: u16, cr: u16) -> Option<(u16, u16)> {
+    if cr < clip || cr - clip >= inner.height || inner.height == 0 {
+        return None;
+    }
+    Some((
+        inner.x + cc.min(inner.width.saturating_sub(1)),
+        inner.y + (cr - clip),
+    ))
+}
+
+pub(crate) fn downscale_rows_v2(
+    src: &[crate::layout::RowRunsJson],
+    _src_h: u16,
+    _src_w: u16,
+    dst_h: u16,
+    _dst_w: u16,
+) -> Vec<crate::layout::RowRunsJson> {
+    if dst_h == 0 || src.is_empty() {
+        return Vec::new();
+    }
+    let (start, kept) = downscale_window(src, dst_h);
+    src[start..kept].to_vec()
 }
 
 /// Normalise a selection (start, end) into reading-order or block-mode bounds.
@@ -8430,9 +8476,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
             } else if let (Some((cc, cr)), Some(outer)) = (post_draw_cursor, active_pane_area) {
                 // Content lives inside the border-label reservation; use the render's inner rect.
                 let inner = pane_content_inner(outer, &client_border_status, &client_border_format);
-                let cy = inner.y + cr.min(inner.height.saturating_sub(1));
-                let cx = inner.x + cc.min(inner.width.saturating_sub(1));
-                Some((cx, cy))
+                // A pane grid bigger than its screen rect renders
+                // bottom-anchored: downscale_rows_v2 drops `clip` rows off
+                // the top, so pane row r lands at inner.y + r - clip. The
+                // caret must drop the same rows — without it, a window one
+                // row taller than the client puts the caret one row below
+                // the prompt (tenax#2033).
+                let clip = active_pane_clip_offset(&root, inner);
+                clipped_pane_cursor_pos(inner, clip, cc, cr)
             } else {
                 None
             };
@@ -9205,6 +9256,10 @@ mod test_keystroke_echo_window;
 #[cfg(test)]
 #[path = "../tests-rs/test_zoom_cursor_rect.rs"]
 mod test_zoom_cursor_rect;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_oversize_pane_cursor.rs"]
+mod test_oversize_pane_cursor;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_border_status_cursor.rs"]

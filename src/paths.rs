@@ -93,6 +93,22 @@ fn normalize_data_dir_override(raw: &std::ffi::OsStr) -> String {
     path.to_string_lossy().trim_end_matches(['/', '\\']).to_string()
 }
 
+/// `dir` + platform separator + `name` as a String. The fork's historical
+/// `format!("{}\\{}", dir, name)` joins baked the Windows separator into the
+/// string: on unix `\` is not a separator, so `<dir>\<name>` resolved as one
+/// flat filename inside `dir`'s *parent* — the whole registry landed as
+/// litter beside the home dir (tenax #2820). Every `\\` join below and at
+/// call sites goes through these helpers so the separator is real.
+pub(crate) fn sep_join(dir: &str, name: &str) -> String {
+    format!("{}{}{}", dir, std::path::MAIN_SEPARATOR, name)
+}
+
+/// Multi-segment [sep_join]: `join_parts(&[a, b, c])` joins with the
+/// platform separator between each part.
+pub(crate) fn join_parts(parts: &[&str]) -> String {
+    parts.join(&std::path::MAIN_SEPARATOR.to_string())
+}
+
 /// psmux data directory, without a trailing separator. Fallible variant for
 /// call sites that early-exit when home is missing (`.ok()?` /
 /// `Err(_) => return …`). `None` when no home directory is available.
@@ -104,7 +120,7 @@ pub fn psmux_dir_opt() -> Option<String> {
     if home.is_empty() {
         None
     } else {
-        Some(format!("{}\\.psmux", home))
+        Some(join_parts(&[&home, ".psmux"]))
     }
 }
 
@@ -116,7 +132,8 @@ pub fn psmux_dir_opt() -> Option<String> {
 /// behavior is to proceed and let the filesystem call fail gracefully, and a
 /// crash on an unset `USERPROFILE` would be worse.
 pub fn psmux_dir() -> String {
-    psmux_dir_opt().unwrap_or_else(|| "\\.psmux".to_string())
+    psmux_dir_opt()
+        .unwrap_or_else(|| format!("{}.psmux", std::path::MAIN_SEPARATOR))
 }
 
 /// The data root reduced to a comparison key: separators unified and case
@@ -154,12 +171,12 @@ pub fn data_root_tag() -> String {
 /// Path to a fixed-name file directly under the data directory (e.g.
 /// `latency.log`, `last_session`, `next_session_id`, `crash.log`).
 pub fn psmux_dir_file(name: impl AsRef<str>) -> String {
-    format!("{}\\{}", psmux_dir(), name.as_ref())
+    sep_join(&psmux_dir(), name.as_ref())
 }
 
 /// Path to a session's `.port` file (the TCP port its server listens on).
 pub fn port_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.port", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.port", session.as_ref()))
 }
 
 /// Directory holding one ownership marker per server process this data dir
@@ -173,34 +190,34 @@ pub fn port_file(session: impl AsRef<str>) -> String {
 /// marker into its OWN data dir, so ownership is self-declared and needs no
 /// inspection of other processes.
 pub fn server_marker_dir() -> String {
-    format!("{}\\servers", psmux_dir())
+    sep_join(&psmux_dir(), "servers")
 }
 
 /// Path to one server process's ownership marker (see `server_marker_dir`).
 pub fn server_marker_file(pid: u32) -> String {
-    format!("{}\\{}", server_marker_dir(), pid)
+    sep_join(&server_marker_dir(), &pid.to_string())
 }
 
 /// Fallible variant of [`port_file`]: `None` when no data directory can be
 /// determined. Lets a call site early-exit on the same condition without having
 /// to know that `port_file` routes through `psmux_dir`.
 pub fn port_file_opt(session: impl AsRef<str>) -> Option<String> {
-    psmux_dir_opt().map(|dir| format!("{}\\{}.port", dir, session.as_ref()))
+    psmux_dir_opt().map(|dir| sep_join(&dir, &format!("{}.port", session.as_ref())))
 }
 
 /// Path to a session's `.key` file (the auth key for its server).
 pub fn key_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.key", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.key", session.as_ref()))
 }
 
 /// Path to a session's `.sid` file (its stable session id).
 pub fn sid_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.sid", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.sid", session.as_ref()))
 }
 
 /// Path to a session's `.pid` file (the liveness anchor: the server pid).
 pub fn pid_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.pid", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.pid", session.as_ref()))
 }
 
 /// Path to the remembered host palette, shared by every server in this data
@@ -218,12 +235,22 @@ pub fn pid_file(session: impl AsRef<str>) -> String {
 /// retirement never happen. A wrong guess is self correcting: the report differs,
 /// the spares are retired exactly as before, and the new value is remembered.
 pub fn host_colors_file() -> String {
-    format!("{}\\host_colors", psmux_dir())
+    sep_join(&psmux_dir(), "host_colors")
 }
 
 /// Path to a session's `.spawnlock` file (the warm-pool spawn lock).
 pub fn spawnlock_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.spawnlock", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.spawnlock", session.as_ref()))
+}
+
+/// Path to a session's `.spawnat` file: its mtime is the last warm-standby
+/// spawn attempt, written by every code path that spawns one. The periodic
+/// `ensure_warm_standby` check uses it to bound respawns when a standby
+/// never settles (tenax issue #1990): a spawn that produced no live standby
+/// gets retried per-interval, not per-check, and the stamp being a file makes
+/// the bound apply across every server in the namespace, not per process.
+pub fn spawnat_file(session: impl AsRef<str>) -> String {
+    sep_join(&psmux_dir(), &format!("{}.spawnat", session.as_ref()))
 }
 
 /// Path to a session's `.act` file: the last-activity stamp (Unix epoch
@@ -235,7 +262,7 @@ pub fn spawnlock_file(session: impl AsRef<str>) -> String {
 /// server per session, so the ranking input has to live in the shared registry
 /// where it can be read without connecting to anything (issue #603).
 pub fn activity_file(session: impl AsRef<str>) -> String {
-    format!("{}\\{}.act", psmux_dir(), session.as_ref())
+    sep_join(&psmux_dir(), &format!("{}.act", session.as_ref()))
 }
 
 /// Directory holding one namespace-identity file per `-L` namespace (issue #509).
@@ -301,9 +328,10 @@ mod tests {
         let _restore = Restore(std::env::var_os("PSMUX_DATA_DIR"));
         std::env::remove_var("PSMUX_DATA_DIR");
         // The test environment always has a home, so the data dir resolves to
-        // {home}\.psmux and the two accessors agree.
+        // {home}<sep>.psmux and the two accessors agree.
         let dir = psmux_dir();
-        assert!(dir.ends_with("\\.psmux"), "got {dir:?}");
+        let want = format!("{}.psmux", std::path::MAIN_SEPARATOR);
+        assert!(dir.ends_with(&want), "got {dir:?}");
         assert_eq!(psmux_dir_opt().as_deref(), Some(dir.as_str()));
     }
 
@@ -311,11 +339,35 @@ mod tests {
     fn per_session_helpers_append_name_and_suffix_to_data_dir() {
         let _lock = crate::util::lock_test_env();
         let dir = psmux_dir();
-        assert_eq!(port_file("foo"), format!("{}\\foo.port", dir));
-        assert_eq!(key_file("foo"), format!("{}\\foo.key", dir));
-        assert_eq!(sid_file("foo"), format!("{}\\foo.sid", dir));
-        assert_eq!(pid_file("foo"), format!("{}\\foo.pid", dir));
-        assert_eq!(spawnlock_file("foo"), format!("{}\\foo.spawnlock", dir));
+        assert_eq!(port_file("foo"), sep_join(&dir, "foo.port"));
+        assert_eq!(key_file("foo"), sep_join(&dir, "foo.key"));
+        assert_eq!(sid_file("foo"), sep_join(&dir, "foo.sid"));
+        assert_eq!(pid_file("foo"), sep_join(&dir, "foo.pid"));
+        assert_eq!(spawnlock_file("foo"), sep_join(&dir, "foo.spawnlock"));
+    }
+
+    /// tenax #2820: on unix the old `\\` joins made every registry file a
+    /// flat litter name inside the data dir's *parent*. A joined file must
+    /// be a real child of the data dir — `Path::new(file).parent()` answers
+    /// the dir itself on every platform.
+    #[test]
+    fn registry_files_are_children_of_the_data_dir() {
+        let _lock = crate::util::lock_test_env();
+        let dir = psmux_dir();
+        for f in [port_file("foo"), host_colors_file()] {
+            let p = std::path::Path::new(&f);
+            assert_eq!(
+                p.parent().and_then(|x| x.to_str()),
+                Some(dir.as_str()),
+                "{f:?} is not inside {dir:?}"
+            );
+        }
+        let marker_file = server_marker_file(42);
+        let marker = std::path::Path::new(&marker_file);
+        assert_eq!(
+            marker.parent().and_then(|x| x.to_str()),
+            Some(server_marker_dir().as_str())
+        );
     }
 
     #[test]
@@ -323,7 +375,7 @@ mod tests {
         let _lock = crate::util::lock_test_env();
         assert_eq!(
             psmux_dir_file("latency.log"),
-            format!("{}\\latency.log", psmux_dir())
+            sep_join(&psmux_dir(), "latency.log")
         );
     }
 }

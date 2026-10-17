@@ -705,6 +705,46 @@ fn build_send_paste_control(cmd_args: &[&str]) -> io::Result<String> {
     Ok(format!("send-paste {}\n", payload))
 }
 
+/// feed-pane: `psmux feed-pane [-t target] <base64>` — the bytes decode to
+/// text the target pane's parser processes as pane OUTPUT, the way bytes
+/// written to a real pty's slave side would arrive (tenax #2710). `-t`
+/// picks the session's server like send-paste and is not on the wire.
+fn build_feed_pane_control(cmd_args: &[&str]) -> io::Result<String> {
+    let mut payload: Option<&str> = None;
+    let mut i = 1;
+    while i < cmd_args.len() {
+        match cmd_args[i] {
+            "-t" => {
+                i += 1;
+                if i >= cmd_args.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "feed-pane -t requires a target",
+                    ));
+                }
+            }
+            value if payload.is_none() => payload = Some(value),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "feed-pane requires exactly one UTF-8 base64 payload",
+                ));
+            }
+        }
+        i += 1;
+    }
+
+    let payload = payload
+        .filter(|value| crate::util::base64_decode(value).is_some())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "feed-pane requires exactly one UTF-8 base64 payload",
+            )
+        })?;
+    Ok(format!("feed-pane {}\n", payload))
+}
+
 fn main() {
     crate::startup_trace::mark("cli.entry");
     if let Err(e) = run_main() {
@@ -1818,7 +1858,7 @@ fn run_main() -> io::Result<()> {
                     let warm_port_opt = std::fs::read_to_string(&warm_port_path)
                         .ok()
                         .and_then(|s| s.trim().parse::<u16>().ok());
-                    let claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
+                    let claim_path = crate::paths::sep_join(&psmux_dir, &format!("{}.claiming.{}", warm_base, std::process::id()));
                     if let Some(warm_port) = warm_port_opt {
                         if std::fs::rename(&warm_port_path, &claim_path).is_ok() {
                             let warm_addr = format!("127.0.0.1:{}", warm_port);
@@ -2532,6 +2572,11 @@ fn run_main() -> io::Result<()> {
             "send-paste" => {
                 let normalized: Vec<&str> = cmd_args.iter().map(|arg| arg.as_str()).collect();
                 send_control(build_send_paste_control(&normalized)?)?;
+                return Ok(());
+            }
+            "feed-pane" => {
+                let normalized: Vec<&str> = cmd_args.iter().map(|arg| arg.as_str()).collect();
+                send_control(build_feed_pane_control(&normalized)?)?;
                 return Ok(());
             }
             // select-pane - Select the active pane
@@ -5126,7 +5171,7 @@ fn run_main() -> io::Result<()> {
         let warm_port_opt = if warm_disabled { None } else {
             std::fs::read_to_string(&warm_port_path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         };
-        let warm_claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
+        let warm_claim_path = crate::paths::sep_join(&psmux_dir, &format!("{}.claiming.{}", warm_base, std::process::id()));
         if let Some(port) = warm_port_opt {
             if std::fs::rename(&warm_port_path, &warm_claim_path).is_ok() {
             let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
@@ -6101,6 +6146,36 @@ mod sbai_7120_tests {
         assert_eq!(
             build_send_paste_control(&["send-paste", "-t", "dev:0.1", "YQ=="]).unwrap(),
             "send-paste YQ==\n",
+        );
+    }
+}
+
+#[cfg(test)]
+mod feed_pane_tests {
+    use super::build_feed_pane_control;
+
+    #[test]
+    fn feed_pane_cli_forwards_one_base64_frame() {
+        // \x1b[?1049l — the RMCUP the host's stuck-alt Fix feeds (tenax #2710).
+        assert_eq!(
+            build_feed_pane_control(&["feed-pane", "G1s/MTA0OWw="]).unwrap(),
+            "feed-pane G1s/MTA0OWw=\n",
+        );
+    }
+
+    #[test]
+    fn feed_pane_cli_rejects_missing_or_non_base64_payload() {
+        assert!(build_feed_pane_control(&["feed-pane"]).is_err());
+        assert!(build_feed_pane_control(&["feed-pane", "not base64"]).is_err());
+        assert!(build_feed_pane_control(&["feed-pane", "YQ==", "Yg=="]).is_err());
+        assert!(build_feed_pane_control(&["feed-pane", "-t"]).is_err());
+    }
+
+    #[test]
+    fn feed_pane_cli_preserves_optional_target_syntax() {
+        assert_eq!(
+            build_feed_pane_control(&["feed-pane", "-t", "=work:", "G1s/MTA0OWw="]).unwrap(),
+            "feed-pane G1s/MTA0OWw=\n",
         );
     }
 }

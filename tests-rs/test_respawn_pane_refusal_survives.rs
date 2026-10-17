@@ -307,6 +307,7 @@ fn every_question_mark_in_the_event_loop_is_a_classified_one() {
         "send_text_to_active",
         "send_key_to_active",
         "send_bytes_to_active",
+        "feed_output_to_active",
         "send_paste_to_active",
         ".map_err(",
         ".ok_or_else(",

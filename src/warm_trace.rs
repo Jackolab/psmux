@@ -51,7 +51,7 @@ pub fn log(msg: &str) {
         let tmp = std::env::var("TEMP")
             .or_else(|_| std::env::var("TMP"))
             .unwrap_or_else(|_| ".".to_string());
-        format!("{}\\psmux_warm_trace.log", tmp)
+        crate::paths::join_parts(&[&tmp, "psmux_warm_trace.log"])
     });
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = std::io::Write::write_all(

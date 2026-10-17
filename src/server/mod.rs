@@ -26,7 +26,7 @@ use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_st
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
 use options::{get_option_value, render_window_options, apply_set_option};
 
-use crate::input::{send_text_to_active, send_bytes_to_active, send_key_to_active, send_paste_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
+use crate::input::{send_text_to_active, send_bytes_to_active, send_key_to_active, send_paste_to_active, feed_output_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, move_copy_cursor, current_prompt_pos,
     yank_selection, scroll_copy_up, scroll_copy_down, switch_with_copy_save,
     capture_active_pane_text, capture_active_pane_range, capture_active_pane_styled};
@@ -277,7 +277,7 @@ fn warm_debug(msg: &str) {
         let tmp = env::var("TEMP")
             .or_else(|_| env::var("TMP"))
             .unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}\\psmux_warm_debug.log", tmp);
+        let path = crate::paths::join_parts(&[&tmp, "psmux_warm_debug.log"]);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -419,6 +419,41 @@ fn warm_base_name(app: &AppState) -> String {
 /// How often a running server checks that a standby still exists.
 const WARM_STANDBY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The minimum gap between standby respawn attempts driven by the periodic
+/// check (tenax issue #1990). Every spawn writes `<base>.spawnat`, so when a
+/// standby never settles — the spawn dies before registering, or its registry
+/// is misread — the next check sees a young stamp and waits instead of
+/// spawning again. On Windows each attempt is one hidden console window;
+/// unchecked, the 10 s check produced ~6 dead spawns a minute forever.
+/// Claim-refill and startup spawns bypass this: they only run when a real
+/// standby was just consumed, which is the case that must stay instant.
+const WARM_RESPAWN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a periodic respawn may proceed given the age of the last spawn
+/// attempt (`None` = no stamp, no attempt ever recorded).
+fn warm_respawn_due(stamp_age: Option<Duration>) -> bool {
+    stamp_age.map_or(true, |age| age >= WARM_RESPAWN_MIN_INTERVAL)
+}
+
+/// Age of the `<base>.spawnat` stamp, or None when there is none to read.
+fn warm_spawn_stamp_age(base: &str) -> Option<Duration> {
+    stamp_file_age(&crate::paths::spawnat_file(base))
+}
+
+/// mtime age of a stamp file; a future mtime reads as "just written".
+fn stamp_file_age(path: &str) -> Option<Duration> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(std::time::SystemTime::now().duration_since(mtime).unwrap_or(Duration::ZERO))
+}
+
+/// Record a standby spawn attempt. Written before the spawn syscall so a
+/// spawn whose process dies instantly is still bounded by the gate. The
+/// body names the spawned pid for debuggability; only the mtime is read.
+fn warm_spawn_stamp(base: &str) {
+    let path = crate::paths::spawnat_file(base);
+    let _ = std::fs::write(&path, format!("{}", std::process::id()));
+}
+
 /// Put a standby back if there is not one.
 ///
 /// `spawn_warm_server` was only ever called from two places, a server starting
@@ -442,6 +477,13 @@ fn ensure_warm_standby(app: &AppState) {
     // a standby that was never started looks like too, so both fall through to
     // the spawner rather than being assumed healthy.
     if crate::session::registry_pid_anchor_alive(&warm_base_name(app)) == Some(true) {
+        return;
+    }
+    // Bound retries so a standby that never registers cannot be re-attempted
+    // every check tick (#1990). The stamp is shared across every server in
+    // the namespace, so N live sessions cannot each pay a spawn.
+    if !warm_respawn_due(warm_spawn_stamp_age(&warm_base_name(app))) {
+        warm_debug("periodic check: standby still missing, but a spawn was attempted recently -- waiting");
         return;
     }
     warm_debug("periodic check: no live standby -- respawning");
@@ -494,6 +536,56 @@ fn check_warm_standby_orphaned(app: &AppState) -> crate::session::WarmStandbyVer
     crate::session::warm_standby_verdict(&facts)
 }
 
+/// What the probe of an existing `__warm__.port` established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmVerify {
+    /// The server at the port answered AUTH + `display-message` as `__warm__`.
+    Genuine,
+    /// A live server answered, but under a real session name: the pointer is
+    /// stale (the standby was claimed and rekeyed, releasing the mutex), so
+    /// clearing it and spawning a replacement is correct.
+    OtherSession,
+    /// No conclusive answer — unreadable port/key, refused connect, or a
+    /// timed-out/failed AUTH round-trip. The owner may still be alive.
+    Unreachable,
+}
+
+/// What `spawn_warm_server` does after its probe produced `verify`, given
+/// whether the `.pid` anchor names a live psmux (`owner_alive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarmSpawnAction {
+    /// Clear the stale registry and spawn a replacement standby.
+    Spawn,
+    /// The `.pid` owner is a live psmux that did not answer: it still holds
+    /// the `__warm__` session mutex, so a spawned sibling exits on entry —
+    /// the dead-spawn churn of tenax issue #1990. End the owner by identity;
+    /// a later check spawns the replacement.
+    EndOwner,
+    /// The standby is genuine; do nothing.
+    Leave,
+}
+
+/// The decision, kept free of I/O so it is exhaustively testable.
+///
+/// `OtherSession` always spawns: a claim rekeyed the mutex away and removed
+/// the warm `.pid`, so the name is free and the pool must refill. A live
+/// anchor under `Unreachable` can only be a wedged standby — a claimed
+/// session deletes `__warm__.pid` — so ending it is the only act that can
+/// help, and it is bounded by the respawn stamp.
+fn warm_spawn_action(verify: WarmVerify, owner_alive: bool) -> WarmSpawnAction {
+    match verify {
+        WarmVerify::Genuine => WarmSpawnAction::Leave,
+        WarmVerify::OtherSession => WarmSpawnAction::Spawn,
+        WarmVerify::Unreachable => {
+            if owner_alive {
+                WarmSpawnAction::EndOwner
+            } else {
+                WarmSpawnAction::Spawn
+            }
+        }
+    }
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
@@ -524,7 +616,7 @@ fn spawn_warm_server(app: &AppState) {
         // claimed session.  That server answers TCP connects but is NOT warm,
         // so returning early here means warm never re-establishes and every
         // subsequent open stays cold (~1-5s) until the pointer is manually removed.
-        let mut is_genuine_warm = false;
+        let mut verify = WarmVerify::Unreachable;
         if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
             if let Ok(port) = port_str.trim().parse::<u16>() {
                 let addr = format!("127.0.0.1:{}", port);
@@ -546,13 +638,22 @@ fn spawn_warm_server(app: &AppState) {
                             ) {
                                 Ok(resp) if resp.trim() == "__warm__" => {
                                     warm_debug("early-return: existing warm verified alive");
-                                    is_genuine_warm = true;
+                                    verify = WarmVerify::Genuine;
+                                }
+                                // An empty body means the listener answered
+                                // nothing — inconclusive, like a failed read.
+                                // A wedged standby accepts the TCP connect and
+                                // returns exactly this; it must not read as a
+                                // claimed session (#1990).
+                                Ok(resp) if resp.trim().is_empty() => {
+                                    warm_debug("warm port reachable but answered empty — treating as unreachable");
                                 }
                                 Ok(resp) => {
                                     warm_debug(&format!(
                                         "warm port reachable but session='{}' (not __warm__) — treating as stale",
                                         resp.trim()
                                     ));
+                                    verify = WarmVerify::OtherSession;
                                 }
                                 Err(_) => {
                                     warm_debug("warm port reachable but auth/query failed — treating as stale");
@@ -563,8 +664,40 @@ fn spawn_warm_server(app: &AppState) {
                 }
             }
         }
-        if is_genuine_warm {
-            return;
+        let owner_alive =
+            crate::session::registry_pid_anchor_alive(&warm_base) == Some(true);
+        match warm_spawn_action(verify, owner_alive) {
+            WarmSpawnAction::Leave => return,
+            WarmSpawnAction::EndOwner => {
+                // A live standby that cannot answer AUTH cannot be claimed
+                // either — it is dead weight. End it by the recorded identity
+                // so its session mutex releases, then leave the registry files:
+                // the next check (bounded by the respawn stamp) spawns the
+                // replacement once the anchor reads dead. Killing is the same
+                // identity-gated terminate kill-server's fallback uses.
+                let pid_path = crate::paths::pid_file(&warm_base);
+                let ended = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|s| crate::session::parse_pid_file_contents(&s))
+                    .and_then(|(pid, creation)| {
+                        let c = creation?;
+                        crate::session::confirms_identity(
+                            crate::platform::process_kill::process_creation_time(pid),
+                            c,
+                        )
+                        .then_some(pid)
+                    })
+                    .map(|pid| {
+                        crate::platform::process_kill::terminate_server_pid(pid, None);
+                        pid
+                    });
+                warm_debug(&format!(
+                    "warm unreachable but its pid anchor is alive — ended wedged standby {:?}, respawn on next check",
+                    ended
+                ));
+                return;
+            }
+            WarmSpawnAction::Spawn => {}
         }
         // Stale or wrong-server port file — remove it (and matching key/sid files)
         warm_debug("removing STALE warm port/key/sid (unreachable or not a warm server)");
@@ -574,6 +707,7 @@ fn spawn_warm_server(app: &AppState) {
         let warm_sid_path = crate::paths::sid_file(&warm_base);
         let _ = std::fs::remove_file(&warm_sid_path);
     }
+    warm_spawn_stamp(&warm_base);
     warm_debug("SPAWNING new warm server");
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
     let mut args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
@@ -619,14 +753,32 @@ fn spawn_warm_server(app: &AppState) {
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new(&exe);
-        for a in &args { cmd.arg(a); }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.spawn();
+        let spawned = spawn_standby_unix(&exe, &args);
+        warm_debug(&format!("spawned warm server pid={:?}", spawned));
         drop(spawn_lock);
     }
+}
+
+/// Spawn the standby and hand its `Child` to a reaper thread (tenax
+/// #2804). A dropped `Child` is never waitpid'd, so every standby that
+/// exited early — a duplicate losing the `__warm__` mutex, or the orphan
+/// watchdog's end — stayed in the process table as a zombie, one per
+/// `WARM_RESPAWN_MIN_INTERVAL` respawn. The parked thread collects the
+/// exit the moment it lands; the handle itself is not needed elsewhere.
+/// Returns the spawned pid, mirroring the Windows log line.
+#[cfg(not(windows))]
+fn spawn_standby_unix(exe: &std::path::Path, args: &[String]) -> Option<u32> {
+    let mut cmd = std::process::Command::new(exe);
+    for a in args { cmd.arg(a); }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Some(pid)
 }
 
 /// Parse a popup dimension spec: "80" (absolute) or "95%" (percentage of term_dim).
@@ -848,7 +1000,7 @@ fn drain_plugin_req(
 fn append_data_dir_report(filename: &str, base: &str, body: &str) {
     let Some(dir) = crate::paths::psmux_dir_opt() else { return };
     let _ = std::fs::create_dir_all(&dir);
-    let path = format!("{}\\{}", dir, filename);
+    let path = crate::paths::sep_join(&dir, filename);
     append_report_at(&path, base, body, DATA_DIR_REPORT_CAP_BYTES);
 }
 
@@ -994,7 +1146,7 @@ pub(crate) fn write_startup_error_log(err: &dyn std::fmt::Display, base: &str) {
 
 /// Absolute path to `~/.psmux/server-startup.log`, or None if no home dir.
 pub(crate) fn startup_error_log_path() -> Option<String> {
-    Some(format!("{}\\server-startup.log", crate::paths::psmux_dir_opt()?))
+    Some(crate::paths::sep_join(&crate::paths::psmux_dir_opt()?, "server-startup.log"))
 }
 
 /// Read the real failure reason out of a *fresh* `server-startup.log`.
@@ -1183,7 +1335,7 @@ pub(crate) fn active_pane_identity(app: &AppState) -> (usize, usize) {
 
 /// Absolute path to `~/.psmux/config-warnings.log`, or None if no home dir.
 pub(crate) fn config_warnings_log_path() -> Option<String> {
-    Some(format!("{}\\config-warnings.log", crate::paths::psmux_dir_opt()?))
+    Some(crate::paths::sep_join(&crate::paths::psmux_dir_opt()?, "config-warnings.log"))
 }
 
 /// Persist non-fatal config parse warnings so the attaching client can echo
@@ -2234,6 +2386,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Staggered off the registry tick so the two file passes do not land on the
     // same iteration.
     let mut last_warm_standby_check = Instant::now();
+    #[cfg(windows)]
+    let mut last_marker_prune = Instant::now();
     let mut last_warm_orphan_check = Instant::now();
 
     // #559: alert detection (activity/bell/monitor-silence) used to run only
@@ -2360,6 +2514,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         if last_registry_check.elapsed() >= Duration::from_secs(5) {
             last_registry_check = Instant::now();
             ensure_session_registry_files(&app);
+        }
+        // tenax #2804: a dead standby self-registers a `servers\<pid>`
+        // marker before it dies, and the only other sweep is the startup
+        // reaper — markers used to pile up for the server's whole life.
+        // A stale marker names a dead or recycled pid and can never
+        // authorise a kill, so pruning is cheap bookkeeping. Windows-only:
+        // off Windows the marker is never written and its liveness check
+        // (process_creation_time) has no answer.
+        #[cfg(windows)]
+        if last_marker_prune.elapsed() >= WARM_RESPAWN_MIN_INTERVAL {
+            last_marker_prune = Instant::now();
+            let dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+            let owned = crate::session::read_owned_server_pids(&dir);
+            crate::session::prune_stale_server_markers(&dir, &owned);
         }
         // A standby that died used to stay dead until the next session was
         // created, which quietly turned every `new-session` back into a cold
@@ -3922,6 +4090,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SendBytes(bytes) => {
                     send_bytes_to_active(&mut app, &bytes)?;
+                }
+                CtrlReq::FeedPaneOutput(bytes) => {
+                    feed_output_to_active(&mut app, &bytes)?;
                 }
                 CtrlReq::SendKeys(keys, literal) => {
                     let in_copy = app.mode.in_copy();
@@ -8466,6 +8637,13 @@ mod test_issue674_claim_window_name;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue677_warm_spawn_lock.rs"]
 mod test_issue677_warm_spawn_lock;
+#[cfg(test)]
+#[path = "../../tests-rs/test_tenax1990_warm_respawn.rs"]
+mod test_tenax1990_warm_respawn;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue2804_warm_reap.rs"]
+mod test_issue2804_warm_reap;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue706_config_warnings_reply.rs"]

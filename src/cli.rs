@@ -129,6 +129,7 @@ const ARGS_TEMPLATES: &[(&str, &str, &str)] = &[
     ("choose-window",         "",           "F:f:K:kNO:rt:yZ"),
     ("server-info",           "info",       ""),
     ("send-paste",            "",           "t:"),
+    ("feed-pane",             "",           "t:"),
 ];
 
 /// Value-taking flags psmux adds to a command that tmux's template does not

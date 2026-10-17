@@ -35,7 +35,7 @@ fn push_run_underline(run: &crate::layout::CellRunJson, out: &mut String) {
 fn popup_debug(msg: &str) {
     if std::env::var("PSMUX_POPUP_DEBUG").map(|v| v == "1").unwrap_or(false) {
         let tmp = std::env::var("TEMP").or_else(|_| std::env::var("TMP")).unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}\\psmux_popup_debug.log", tmp);
+        let path = crate::paths::join_parts(&[&tmp, "psmux_popup_debug.log"]);
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = std::io::Write::write_all(&mut f, format!("[{} pid={}] {}\n", ts, std::process::id(), msg).as_bytes());

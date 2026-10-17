@@ -3289,7 +3289,7 @@ pub fn build_raw_command(raw_args: &[String]) -> CommandBuilder {
 ///
 /// We accept all DECSCUSR cursor shape values (0-6) from child processes.
 /// Value 0 resets to default, 1-2 = block, 3-4 = underline, 5-6 = bar.
-fn scan_cursor_shape(data: &[u8]) -> Option<u8> {
+pub(crate) fn scan_cursor_shape(data: &[u8]) -> Option<u8> {
     let mut last_shape: Option<u8> = None;
     let mut i = 0;
     while i < data.len() {
@@ -3315,7 +3315,7 @@ fn scan_cursor_shape(data: &[u8]) -> Option<u8> {
 }
 
 /// Returns true if `data` contains the RMCUP sequence (ESC[?1049l).
-fn scan_rmcup(data: &[u8]) -> bool {
+pub(crate) fn scan_rmcup(data: &[u8]) -> bool {
     const RMCUP: &[u8] = b"\x1b[?1049l";
     data.windows(RMCUP.len()).any(|w| w == RMCUP)
 }
@@ -3324,9 +3324,41 @@ fn scan_rmcup(data: &[u8]) -> bool {
 /// ConPTY children (e.g. pwsh) emit this at startup and after session events
 /// such as lock/unlock.  The host must respond with ESC[row;colR or the
 /// child blocks indefinitely.
-fn scan_cpr_query(data: &[u8]) -> bool {
+pub(crate) fn scan_cpr_query(data: &[u8]) -> bool {
     const CPR: &[u8] = b"\x1b[6n";
     data.contains(&0x1b) && data.windows(CPR.len()).any(|w| w == CPR)
+}
+
+/// Feed `data` through the pane's live parser as if the child had emitted
+/// it — output-direction injection, the psmux counterpart of writing bytes
+/// to a real pty's slave side (tenax #2710). `#{pane_tty}` is a compat label
+/// with no file behind it, so a caller that needs the mux to process escape
+/// output — the host's stuck-alt Fix writing RMCUP — goes through `feed-pane`
+/// here instead of open(2). The child never sees the bytes.
+///
+/// Scans run BEFORE the parse and bumps run after it, in the reader loop's
+/// order: cursor shape and RMCUP land on `cursor_shape`, a CPR query still
+/// sets the reply pendings, then the version bump + server wake every batch
+/// ends with. Feeds `live_term` when copy mode froze `term`, the same parser
+/// `#{alternate_on}` reads once the snapshot lifts.
+pub(crate) fn feed_pane_output(pane: &Pane, data: &[u8]) {
+    if let Some(shape) = scan_cursor_shape(data) {
+        pane.cursor_shape.store(shape, Ordering::Release);
+    }
+    if scan_rmcup(data) {
+        pane.cursor_shape.store(0, Ordering::Release);
+    }
+    if scan_cpr_query(data) {
+        pane.cpr_pending.store(true, Ordering::Release);
+        crate::types::CPR_DATA_PENDING.store(true, Ordering::Release);
+    }
+    let parser = pane.live_term.as_ref().unwrap_or(&pane.term);
+    if let Ok(mut p) = parser.lock() {
+        p.process(data);
+    }
+    pane.data_version.fetch_add(1, Ordering::Release);
+    crate::types::PTY_DATA_READY.store(true, Ordering::Release);
+    crate::types::wake_server_loop();
 }
 
 /// Issue #597: the terminal name and version psmux reports for XTVERSION
@@ -4491,3 +4523,7 @@ mod tests_issue683_shell_env;
 #[cfg(all(test, windows))]
 #[path = "../tests-rs/test_issue712_bash_quote_strip.rs"]
 mod tests_issue712_bash_quote_strip;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_feed_pane.rs"]
+mod test_feed_pane;

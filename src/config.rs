@@ -314,10 +314,10 @@ pub fn load_config(app: &mut AppState) {
     // used the real Windows profile directory.
     let home = crate::paths::home_dir();
     let paths = vec![
-        format!("{}\\.psmux.conf", home),
-        format!("{}\\.psmuxrc", home),
-        format!("{}\\.tmux.conf", home),
-        format!("{}\\.config\\psmux\\psmux.conf", home),
+        crate::paths::join_parts(&[&home, ".psmux.conf"]),
+        crate::paths::join_parts(&[&home, ".psmuxrc"]),
+        crate::paths::join_parts(&[&home, ".tmux.conf"]),
+        crate::paths::join_parts(&[&home, ".config", "psmux", "psmux.conf"]),
     ];
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(&path) {
@@ -1664,16 +1664,16 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
                 if plugin_name != "ppm" {
                     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                     let xdg_config = env::var("XDG_CONFIG_HOME")
-                        .unwrap_or_else(|_| format!("{}\\.config", home));
+                        .unwrap_or_else(|_| crate::paths::join_parts(&[&home, ".config"]));
                     let candidates = [
                         // Classic paths: ~/.psmux/plugins/
-                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, base.replace('/', "\\")),
-                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, plugin_name),
-                        format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", home, plugin_name),
+                        crate::paths::join_parts(&[&home, ".psmux", "plugins", &base.replace('/', &std::path::MAIN_SEPARATOR.to_string()), "plugin.conf"]),
+                        crate::paths::join_parts(&[&home, ".psmux", "plugins", plugin_name, "plugin.conf"]),
+                        crate::paths::join_parts(&[&home, ".psmux", "plugins", "psmux-plugins", plugin_name, "plugin.conf"]),
                         // XDG paths: ~/.config/psmux/plugins/
-                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, base.replace('/', "\\")),
-                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, plugin_name),
-                        format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", xdg_config, plugin_name),
+                        crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", &base.replace('/', &std::path::MAIN_SEPARATOR.to_string()), "plugin.conf"]),
+                        crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", plugin_name, "plugin.conf"]),
+                        crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", "psmux-plugins", plugin_name, "plugin.conf"]),
                     ];
                     let mut found = false;
                     for conf in &candidates {
@@ -1692,13 +1692,13 @@ pub fn parse_option_value(app: &mut AppState, key: &str, value: &str, _is_global
                     if !found {
                         let ps1_candidates = [
                             // Classic paths
-                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, base.replace('/', "\\"), plugin_name),
-                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
-                            format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
+                            crate::paths::join_parts(&[&home, ".psmux", "plugins", &base.replace('/', &std::path::MAIN_SEPARATOR.to_string()), &format!("{}.ps1", plugin_name)]),
+                            crate::paths::join_parts(&[&home, ".psmux", "plugins", plugin_name, &format!("{}.ps1", plugin_name)]),
+                            crate::paths::join_parts(&[&home, ".psmux", "plugins", "psmux-plugins", plugin_name, &format!("{}.ps1", plugin_name)]),
                             // XDG paths
-                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, base.replace('/', "\\"), plugin_name),
-                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
-                            format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
+                            crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", &base.replace('/', &std::path::MAIN_SEPARATOR.to_string()), &format!("{}.ps1", plugin_name)]),
+                            crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", plugin_name, &format!("{}.ps1", plugin_name)]),
+                            crate::paths::join_parts(&[&xdg_config, "psmux", "plugins", "psmux-plugins", plugin_name, &format!("{}.ps1", plugin_name)]),
                         ];
                         for ps1 in &ps1_candidates {
                             if std::path::Path::new(ps1).exists() {
@@ -2326,11 +2326,11 @@ pub fn source_file(app: &mut AppState, path: &str) {
     // XDG equivalent (~/.config/psmux/) does, use that instead (issue #135).
     let expanded_path = if !std::path::Path::new(&expanded_path).exists() {
         let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        let classic = format!("{}\\.psmux\\", home);
+        let classic = format!("{}{}", crate::paths::join_parts(&[&home, ".psmux"]), std::path::MAIN_SEPARATOR);
         if expanded_path.starts_with(&classic) {
             let xdg_base = env::var("XDG_CONFIG_HOME")
-                .unwrap_or_else(|_| format!("{}\\.config", home));
-            let xdg_alt = expanded_path.replacen(&classic, &format!("{}\\psmux\\", xdg_base), 1);
+                .unwrap_or_else(|_| crate::paths::join_parts(&[&home, ".config"]));
+            let xdg_alt = expanded_path.replacen(&classic, &format!("{}{}", crate::paths::join_parts(&[&xdg_base, "psmux"]), std::path::MAIN_SEPARATOR), 1);
             if std::path::Path::new(&xdg_alt).exists() { xdg_alt } else { expanded_path }
         } else {
             expanded_path

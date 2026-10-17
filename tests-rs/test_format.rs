@@ -571,6 +571,23 @@ fn test_session_format_alias() {
     assert_eq!(expand_var("session_format", &app, 0), "1");
 }
 
+// ── tenax #2750: session_attached is a client count, not a bool ──
+
+#[test]
+fn test_session_attached_reports_client_count() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.attached_clients = 0;
+    assert_eq!(expand_var("session_attached", &app, 0), "0");
+    app.attached_clients = 1;
+    assert_eq!(expand_var("session_attached", &app, 0), "1");
+    // Two attached clients — e.g. the host's -CC activity watcher plus
+    // a phone attach — must read 2: tmux counts attaches, and tenax's
+    // `others` derives from this field (it subtracts known watchers).
+    app.attached_clients = 2;
+    assert_eq!(expand_var("session_attached", &app, 0), "2");
+}
+
 // ── Issue #164: expand_format must preserve #[style] directives ──
 
 #[test]

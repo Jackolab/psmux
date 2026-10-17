@@ -77,15 +77,27 @@ fn data_dir_env_reroutes_every_derived_path() {
     let _override = EnvGuard::set("PSMUX_DATA_DIR", abs_root());
     assert_eq!(psmux_dir(), abs_root());
     assert_eq!(psmux_dir_opt(), Some(abs_root().to_string()));
-    assert_eq!(port_file("sess"), format!("{}\\sess.port", abs_root()));
-    assert_eq!(key_file("sess"), format!("{}\\sess.key", abs_root()));
-    assert_eq!(sid_file("sess"), format!("{}\\sess.sid", abs_root()));
-    assert_eq!(pid_file("sess"), format!("{}\\sess.pid", abs_root()));
-    assert_eq!(spawnlock_file("sess"), format!("{}\\sess.spawnlock", abs_root()));
-    assert_eq!(port_file_opt("sess"), Some(format!("{}\\sess.port", abs_root())));
-    assert_eq!(psmux_dir_file("latency.log"), format!("{}\\latency.log", abs_root()));
-    assert_eq!(server_marker_dir(), format!("{}\\servers", abs_root()));
-    assert_eq!(server_marker_file(42), format!("{}\\servers\\42", abs_root()));
+    assert_eq!(port_file("sess"), sep_join(abs_root(), "sess.port"));
+    assert_eq!(key_file("sess"), sep_join(abs_root(), "sess.key"));
+    assert_eq!(sid_file("sess"), sep_join(abs_root(), "sess.sid"));
+    assert_eq!(pid_file("sess"), sep_join(abs_root(), "sess.pid"));
+    assert_eq!(
+        spawnlock_file("sess"),
+        sep_join(abs_root(), "sess.spawnlock")
+    );
+    assert_eq!(
+        port_file_opt("sess"),
+        Some(sep_join(abs_root(), "sess.port"))
+    );
+    assert_eq!(
+        psmux_dir_file("latency.log"),
+        sep_join(abs_root(), "latency.log")
+    );
+    assert_eq!(server_marker_dir(), sep_join(abs_root(), "servers"));
+    assert_eq!(
+        server_marker_file(42),
+        join_parts(&[abs_root(), "servers", "42"])
+    );
 
     drop(_override);
     assert_eq!(
@@ -138,7 +150,13 @@ fn unset_data_dir_falls_back_to_home_root() {
     let _drive = EnvGuard::remove("HOMEDRIVE");
     let _path = EnvGuard::remove("HOMEPATH");
 
-    assert_eq!(psmux_dir(), "/unit/test_home\\.psmux");
-    assert_eq!(psmux_dir_opt(), Some("/unit/test_home\\.psmux".to_string()));
-    assert_eq!(port_file("sess"), "/unit/test_home\\.psmux\\sess.port");
+    assert_eq!(psmux_dir(), join_parts(&["/unit/test_home", ".psmux"]));
+    assert_eq!(
+        psmux_dir_opt(),
+        Some(join_parts(&["/unit/test_home", ".psmux"]))
+    );
+    assert_eq!(
+        port_file("sess"),
+        join_parts(&["/unit/test_home", ".psmux", "sess.port"])
+    );
 }

@@ -101,6 +101,7 @@ This is the reference for the commands **psmux itself** accepts and the flags **
 | `select-window` | `selectw` | `lnpt:` | CLI, SRV, CFG, CTL |
 | `send-keys` | `send`, `send-key` | `lRXHN:t:` plus `--` | CLI, SRV, CFG, CTL |
 | `send-paste` | *(none)* | `t:` plus one base64 positional payload | CLI, SRV |
+| `feed-pane` | *(none)* | `t:` plus one base64 positional payload | CLI, SRV |
 | `send-prefix` | *(none)* | none | CLI, SRV, CFG |
 | `send-text` | *(none)* | none, takes the text as positional arguments | SRV |
 | `server-info` | `info` | none | CLI, SRV, CFG, CTL |
@@ -463,6 +464,10 @@ A psmux extension that creates a pane floating above the tiled layout.
 **send-text**, **send-paste**
 - psmux extensions. `send-text` takes the raw text as positional arguments and does no key name parsing. `send-paste` wraps the payload in a bracketed paste sequence and also accepts `-t` at the CLI.
 - `send-paste` takes exactly one positional argument, the text **base64 encoded** (PR #584). Base64 is the wire boundary: the payload can carry newlines, quotes and `;` without ever being read as a second command, and it is not subject to the 8191 character command line limit that `-EncodedCommand` wrappers hit. Anything that is not valid base64, or a second positional, fails with `send-paste requires exactly one UTF-8 base64 payload` at exit 1. PowerShell: `psmux send-paste -t %1 ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)))`.
+
+**feed-pane**
+- psmux extension, the OUTPUT-direction counterpart of `send-paste` (tenax #2710): the decoded bytes enter the target pane's terminal parser as if the child emitted them, exactly like writing to a real pty's slave side. The child never receives them. `#{pane_tty}` is a compat label with no file behind it, so control-side output injection — the host's stuck-alt Fix writing RMCUP — goes through this verb.
+- Same contract as `send-paste`: exactly one UTF-8 base64 positional, `-t` accepted at the CLI for server routing and not carried on the wire. Example — leave the alternate screen: `psmux feed-pane -t =work: G1s/MTA0OWw=` (`\x1b[?1049l`).
 
 ### Configuration commands
 

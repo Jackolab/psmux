@@ -359,7 +359,7 @@ pub fn expand_run_shell_path(cmd: &str) -> String {
     if cmd.contains(&classic_fwd) || cmd.contains(&classic_win) {
         let classic_dir = std::path::Path::new(&home).join(".psmux").join("plugins");
         let xdg_base = std::env::var("XDG_CONFIG_HOME")
-            .unwrap_or_else(|_| format!("{}\\.config", home));
+            .unwrap_or_else(|_| crate::paths::join_parts(&[&home, ".config"]));
         let xdg_dir = std::path::Path::new(&xdg_base).join("psmux").join("plugins");
         if !classic_dir.is_dir() && xdg_dir.is_dir() {
             let xdg_fwd = format!("{}/psmux/plugins/", xdg_base.replace('\\', "/"));

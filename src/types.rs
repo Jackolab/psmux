@@ -2800,6 +2800,11 @@ pub enum CtrlReq {
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
+    /// feed-pane: bytes the pane's terminal parser processes as if the
+    /// child emitted them — the output-direction counterpart to SendBytes
+    /// (tenax #2710). `#{pane_tty}` is a compat label with no file behind
+    /// it, so control-side output injection goes through here.
+    FeedPaneOutput(Vec<u8>),
     SendKeysX(String),  // send-keys -X copy-mode-command
     /// `send-keys -X [-N count] <command>` from a client. Like tmux
     /// (cmd-send-keys.c) it fails with "not in a mode" when the pane is not in
