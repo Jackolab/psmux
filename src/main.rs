@@ -62,7 +62,7 @@ use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedP
 
 use crate::platform::enable_virtual_terminal_processing;
 use crate::cli::{print_help, print_version, print_commands};
-use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
+use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control, send_control_confirmed,
     send_control_with_response, resolve_default_session_name};
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
@@ -2562,7 +2562,7 @@ fn run_main() -> io::Result<()> {
                     }
                     return Ok(());
                 }
-                send_control(cmd)?;
+                send_control_confirmed(cmd)?;
                 return Ok(());
             }
             // Base64 is the protocol boundary: unlike send-keys -l, it cannot
@@ -2571,12 +2571,12 @@ fn run_main() -> io::Result<()> {
             // crossed cmd.exe's 8191-character limit around 2 KiB of text.
             "send-paste" => {
                 let normalized: Vec<&str> = cmd_args.iter().map(|arg| arg.as_str()).collect();
-                send_control(build_send_paste_control(&normalized)?)?;
+                send_control_confirmed(build_send_paste_control(&normalized)?)?;
                 return Ok(());
             }
             "feed-pane" => {
                 let normalized: Vec<&str> = cmd_args.iter().map(|arg| arg.as_str()).collect();
-                send_control(build_feed_pane_control(&normalized)?)?;
+                send_control_confirmed(build_feed_pane_control(&normalized)?)?;
                 return Ok(());
             }
             // select-pane - Select the active pane
@@ -3396,7 +3396,7 @@ fn run_main() -> io::Result<()> {
                 // paste-buffer as `a b`.
                 if let Some(d) = data { cmd.push_str(&format!(" -H {}", crate::util::hex_encode(d.as_bytes()))); }
                 cmd.push('\n');
-                send_control(cmd)?;
+                send_control_confirmed(cmd)?;
                 return Ok(());
             }
             // list-buffers - List paste buffers
@@ -3470,7 +3470,7 @@ fn run_main() -> io::Result<()> {
                 let mut cmd = "delete-buffer".to_string();
                 if let Some(b) = buffer_name { cmd.push_str(&format!(" -b {}", b)); }
                 cmd.push('\n');
-                send_control(cmd)?;
+                send_control_confirmed(cmd)?;
                 return Ok(());
             }
             // display-message - Display a message
@@ -4601,7 +4601,7 @@ fn run_main() -> io::Result<()> {
                     // `printf '%s' 'ARG'` arrived as `printf %s ARG`.
                     cmd.push_str(&format!(" -H {}", crate::util::hex_encode(content.as_bytes())));
                     cmd.push('\n');
-                    send_control(cmd)?;
+                    send_control_confirmed(cmd)?;
                 }
                 return Ok(());
             }

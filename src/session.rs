@@ -2375,6 +2375,17 @@ pub fn remove_session_registry(base: &str) {
 }
 
 pub fn send_control(line: String) -> io::Result<()> {
+    send_control_barrier(line, false)
+}
+
+/// `send_control` for a command whose effect the caller must be able to
+/// trust: an unanswered barrier is an error, not an ack. A paste buffer
+/// the server never confirmed may still land after the caller gave up.
+pub fn send_control_confirmed(line: String) -> io::Result<()> {
+    send_control_barrier(line, true)
+}
+
+fn send_control_barrier(line: String, confirmed: bool) -> io::Result<()> {
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control target={:?} full={:?} argv={:?} line={:?}",
@@ -2421,11 +2432,24 @@ pub fn send_control(line: String) -> io::Result<()> {
     // Read to EOF (bounded by the read timeout): blocks until the server has
     // processed the barrier — i.e. the command has executed — or the connection
     // closes / times out.
+    match drain_barrier(&mut stream) {
+        Err(e) if !confirmed && e.kind() == ErrorKind::TimedOut => Ok(()),
+        r => r,
+    }
+}
+
+/// Read the server's reply to EOF. A read that times out is a `TimedOut`
+/// error: the barrier did not come back, so the command is not known to
+/// have run. A connection the server tore down is an ack.
+pub(crate) fn drain_barrier(stream: &mut std::net::TcpStream) -> io::Result<()> {
     let mut buf = [0u8; 256];
     loop {
-        match std::io::Read::read(&mut stream, &mut buf) {
+        match std::io::Read::read(stream, &mut buf) {
             Ok(0) => break,
             Ok(_) => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err(io::Error::new(ErrorKind::TimedOut, "server did not confirm the command"));
+            }
             Err(_) => break,
         }
     }
@@ -3021,3 +3045,7 @@ mod tests_issue650_cross_session_process_name;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue698_counter_lock_missing_dir.rs"]
 mod tests_issue698_counter_lock_missing_dir;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_barrier_timeout.rs"]
+mod tests_barrier_timeout;
