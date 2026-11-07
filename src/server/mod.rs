@@ -4094,6 +4094,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::FeedPaneOutput(bytes) => {
                     feed_output_to_active(&mut app, &bytes)?;
                 }
+                CtrlReq::InputResult(reply) => {
+                    crate::input::queue_input_result(&mut app, reply);
+                }
                 CtrlReq::SendKeys(keys, literal) => {
                     let in_copy = app.mode.in_copy();
                     if in_copy {

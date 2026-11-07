@@ -90,7 +90,18 @@ impl PaneInputSink for QueuedPaneWriter {
         }
         self.tx.send(PaneInput::InjectPaste(job)).map_err(|e| match e.0 {
             PaneInput::InjectPaste(job) => job,
-            PaneInput::Bytes(_) => unreachable!("sent an InjectPaste"),
+            _ => unreachable!("sent an InjectPaste"),
+        })
+    }
+
+    fn queue_mark(&mut self, reply: std::sync::mpsc::Sender<bool>) -> Result<(), std::sync::mpsc::Sender<bool>> {
+        if self.broken.load(Ordering::Acquire) {
+            let _ = reply.send(false);
+            return Ok(());
+        }
+        self.tx.send(PaneInput::Mark(reply)).map_err(|e| match e.0 {
+            PaneInput::Mark(reply) => reply,
+            _ => unreachable!("sent a Mark"),
         })
     }
 }
@@ -105,6 +116,9 @@ pub(crate) enum PaneInput {
     /// (`WriteConsoleInputW`), the route `input::choose_paste_route` picks
     /// where conhost strips the paste markers from the pipe (issue #684).
     InjectPaste(InjectPaste),
+    /// Answers, once every item queued before it was handled, whether all
+    /// of their pipe writes reached the pane (false once one failed).
+    Mark(std::sync::mpsc::Sender<bool>),
 }
 
 /// A bracketed paste waiting on a pane's queue to be injected into the pane
@@ -134,6 +148,13 @@ pub trait PaneInputSink: std::io::Write + Send {
     /// writer cannot carry it (or its thread is gone).
     fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
         Err(job)
+    }
+
+    /// Queue `reply` behind everything already written; the writer answers
+    /// it as [`PaneInput::Mark`] does.  Returns it when this writer cannot
+    /// say (or its thread is gone).
+    fn queue_mark(&mut self, reply: std::sync::mpsc::Sender<bool>) -> Result<(), std::sync::mpsc::Sender<bool>> {
+        Err(reply)
     }
 }
 
@@ -359,6 +380,9 @@ pub(crate) fn spawn_pane_write_queue_with(
                         }
                         let _ = inner.flush();
                         crate::pty_trace::mark("w", 0, &buf);
+                    }
+                    PaneInput::Mark(reply) => {
+                        let _ = reply.send(!broken_tx.load(Ordering::Acquire) && !closed_rx.load(Ordering::Acquire));
                     }
                     PaneInput::InjectPaste(job) => {
                         if closed_rx.load(Ordering::Acquire) {

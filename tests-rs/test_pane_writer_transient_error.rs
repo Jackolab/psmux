@@ -244,3 +244,22 @@ fn a_write_after_the_writer_broke_fails_instead_of_acking() {
     drop(queue);
     assert!(wait_until("thread exits on queue drop", || dropped.load(Ordering::SeqCst), Duration::from_secs(5)));
 }
+
+/// A mark queued behind writes answers whether every one of them reached
+/// the pane: false once a write failed, true otherwise.
+#[test]
+fn a_mark_answers_whether_the_writes_before_it_reached_the_pane() {
+    for (fail_on, took) in [(usize::MAX, true), (1, false)] {
+        let inner = FailOnNthWriter {
+            fail_on,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            bytes: Arc::new(Mutex::new(Vec::new())),
+            dropped: Arc::new(AtomicBool::new(false)),
+        };
+        let mut queue = spawn_pane_write_queue(Box::new(inner));
+        assert_eq!(queue.write(b"keys").unwrap(), 4);
+        let (reply, answer) = std::sync::mpsc::channel();
+        queue.queue_mark(reply).expect("the queue takes a mark");
+        assert_eq!(answer.recv_timeout(Duration::from_secs(5)), Ok(took), "fail_on {fail_on}");
+    }
+}

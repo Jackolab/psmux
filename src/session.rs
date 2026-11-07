@@ -2433,27 +2433,34 @@ fn send_control_barrier(line: String, confirmed: bool) -> io::Result<()> {
     // processed the barrier — i.e. the command has executed — or the connection
     // closes / times out.
     match drain_barrier(&mut stream) {
-        Err(e) if !confirmed && e.kind() == ErrorKind::TimedOut => Ok(()),
+        // Only a confirmed command fails on an `ERROR:` line; the others
+        // never read the reply and keep acking as before.
+        Err(e) if !confirmed && matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Other) => Ok(()),
         r => r,
     }
 }
 
 /// Read the server's reply to EOF. A read that times out is a `TimedOut`
 /// error: the barrier did not come back, so the command is not known to
-/// have run. A connection the server tore down is an ack.
+/// have run. An `ERROR:` line in the reply is an `Other` error carrying
+/// its text. A connection the server tore down is an ack.
 pub(crate) fn drain_barrier(stream: &mut std::net::TcpStream) -> io::Result<()> {
     let mut buf = [0u8; 256];
+    let mut reply = Vec::new();
     loop {
         match std::io::Read::read(stream, &mut buf) {
             Ok(0) => break,
-            Ok(_) => continue,
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
             Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
                 return Err(io::Error::new(ErrorKind::TimedOut, "server did not confirm the command"));
             }
             Err(_) => break,
         }
     }
-    Ok(())
+    match String::from_utf8_lossy(&reply).lines().find_map(|l| l.strip_prefix("ERROR: ")) {
+        Some(why) => Err(io::Error::new(ErrorKind::Other, why.to_string())),
+        None => Ok(()),
+    }
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
