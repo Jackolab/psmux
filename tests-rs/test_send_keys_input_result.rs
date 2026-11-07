@@ -1,4 +1,5 @@
-// send-keys on the one-shot CLI path acks only input the pane writer took.
+// send-keys, send-paste and paste-buffer on the one-shot CLI path ack only
+// input the pane writer took.
 // The pane writer runs on its own thread, so the handler asks the server
 // loop for the writer's result behind the keys (CtrlReq::InputResult) and
 // reports a failed write as an error instead of an ack.
@@ -24,18 +25,23 @@ fn spawn_handler(listener: TcpListener, tx: mpsc::Sender<CtrlReq>) -> JoinHandle
 fn spawn_loop(rx: mpsc::Receiver<CtrlReq>, took: Option<bool>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(req) = rx.recv() {
-            if let CtrlReq::InputResult(reply) = req {
-                if let Some(took) = took {
-                    let _ = reply.send(took);
-                } else {
-                    std::mem::forget(reply);
-                }
+            match req {
+                CtrlReq::InputResult(reply) => match took {
+                    Some(took) => { let _ = reply.send(took); }
+                    None => std::mem::forget(reply),
+                },
+                CtrlReq::PasteBuffer(_, resp) => { let _ = resp.send(None); }
+                _ => {}
             }
         }
     })
 }
 
 fn send_keys(took: Option<bool>) -> String {
+    one_shot("send-keys hello Enter", took)
+}
+
+fn one_shot(line: &str, took: Option<bool>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     let handler = spawn_handler(listener.try_clone().unwrap(), tx);
@@ -43,7 +49,7 @@ fn send_keys(took: Option<bool>) -> String {
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
     client.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
     write!(client, "AUTH {TEST_KEY}\n").unwrap();
-    write!(client, "send-keys hello Enter\n").unwrap();
+    write!(client, "{line}\n").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read response");
@@ -65,4 +71,16 @@ fn send_keys_the_writer_took_is_an_ack() {
 #[test]
 fn send_keys_with_no_writer_result_in_time_is_still_an_ack() {
     assert_eq!(send_keys(None), "OK\n");
+}
+
+#[test]
+fn send_paste_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("send-paste aGk=", Some(false)), "OK\nERROR: send-paste: pane input failed\n");
+    assert_eq!(one_shot("send-paste aGk=", Some(true)), "OK\n");
+}
+
+#[test]
+fn paste_buffer_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(false)), "OK\nERROR: paste-buffer: pane input failed\n");
+    assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(true)), "OK\n");
 }

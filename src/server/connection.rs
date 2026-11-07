@@ -757,8 +757,7 @@ fn report_failed_input(tx: &TargetedSender<'_>, out: &mut TcpStream, cmd: &str) 
         return;
     }
     if let Ok(false) = rrx.recv_timeout(INPUT_RESULT_WAIT) {
-        let _ = write!(out, "ERROR: {cmd}: pane input failed
-");
+        let _ = write!(out, "ERROR: {cmd}: pane input failed\n");
         let _ = out.flush();
     }
 }
@@ -1935,6 +1934,9 @@ match cmd {
         if let Some(encoded) = args.get(0) {
             if let Some(decoded) = base64_decode(encoded) {
                 let _ = tx.send(CtrlReq::SendPaste(decoded));
+                if !persistent {
+                    report_failed_input(tx, &mut write_stream, "send-paste");
+                }
             }
         }
     }
@@ -2659,13 +2661,17 @@ match cmd {
         }
         let (rtx, rrx) = mpsc::channel::<Option<String>>();
         let _ = tx.send(CtrlReq::PasteBuffer(pb_args, rtx));
-        if let Ok(Some(msg)) = rrx.recv() {
-            if persistent {
-                let _ = tx.send(CtrlReq::ShowTextPopup("paste-buffer".to_string(), format!("ERROR: {}", msg)));
-            } else {
-                let _ = write!(write_stream, "ERROR: {}\n", msg);
-                let _ = write_stream.flush();
+        match rrx.recv() {
+            Ok(Some(msg)) => {
+                if persistent {
+                    let _ = tx.send(CtrlReq::ShowTextPopup("paste-buffer".to_string(), format!("ERROR: {}", msg)));
+                } else {
+                    let _ = write!(write_stream, "ERROR: {}\n", msg);
+                    let _ = write_stream.flush();
+                }
             }
+            Ok(None) if !persistent => report_failed_input(tx, &mut write_stream, "paste-buffer"),
+            _ => {}
         }
     }
     "list-buffers" | "lsb" => {
