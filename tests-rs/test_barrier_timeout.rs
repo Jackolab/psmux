@@ -24,3 +24,16 @@ fn a_connection_the_server_closed_is_an_ack() {
     drop(server.accept().unwrap().0);
     crate::session::drain_barrier(&mut c).expect("EOF after the barrier");
 }
+
+#[test]
+fn an_error_line_before_the_barrier_is_an_error() {
+    use std::io::Write;
+    let (server, mut c) = silent_server();
+    let (mut s, _) = server.accept().unwrap();
+    s.write_all(b"ERROR: send-keys: pane input failed
+{\"session\":\"x\"}
+").unwrap();
+    drop(s);
+    let e = crate::session::drain_barrier(&mut c).expect_err("an ERROR line is not an ack");
+    assert_eq!(e.to_string(), "send-keys: pane input failed");
+}

@@ -3484,6 +3484,34 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Answer `reply` with whether the input queued so far reached the pane
+/// `send_text_to_active` writes to.  The writer answers on its own thread,
+/// so the server loop never waits.  Input a mode or popup takes, and sync
+/// input, has no single writer to ask: those answer true, as before.
+pub fn queue_input_result(app: &mut AppState, reply: std::sync::mpsc::Sender<bool>) {
+    let intercepted = app.mode.in_copy() || matches!(app.mode,
+        Mode::ClockMode | Mode::PopupMode { .. } | Mode::ConfirmMode { .. } | Mode::MenuMode { .. } | Mode::PaneChooser { .. });
+    if intercepted || app.sync_input {
+        let _ = reply.send(true);
+        return;
+    }
+    let win = &mut app.windows[app.active_idx];
+    let pane = match win.floating_focus.and_then(|fi| win.floating.get_mut(fi)) {
+        Some(fp) => Some(&mut fp.pane),
+        None => active_pane_mut(&mut win.root, &win.active_path),
+    };
+    match pane {
+        Some(p) => {
+            if let Err(reply) = p.writer.queue_mark(reply) {
+                let _ = reply.send(true);
+            }
+        }
+        None => {
+            let _ = reply.send(true);
+        }
+    }
+}
+
 /// Dispatch a single character as a copy-mode action.
 fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
     // User bindings from `bind -T copy-mode-vi` / `-T copy-mode` win over the

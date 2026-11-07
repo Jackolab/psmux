@@ -743,6 +743,26 @@ fn parse_new_pane_args(args: &[&str]) -> ParsedNewPane {
 /// Handle a single TCP connection from a client.
 /// Parses auth, optional TARGET/PERSISTENT flags, then dispatches commands
 /// to the main server event loop via the `tx` channel.
+/// How long the one-shot path waits for the pane writer to answer for the
+/// input it queued.  A child that does not read its input stalls the writer;
+/// past this the command is acked as before, since it has not failed.  It
+/// stays under the CLI's 2 s barrier read (session::send_control).
+const INPUT_RESULT_WAIT: Duration = Duration::from_millis(1500);
+
+/// Ask the server loop whether the input `cmd` queued reached its pane, and
+/// write an `ERROR:` line for the CLI when a pipe write failed.
+fn report_failed_input(tx: &TargetedSender<'_>, out: &mut TcpStream, cmd: &str) {
+    let (rtx, rrx) = mpsc::channel::<bool>();
+    if tx.send(CtrlReq::InputResult(rtx)).is_err() {
+        return;
+    }
+    if let Ok(false) = rrx.recv_timeout(INPUT_RESULT_WAIT) {
+        let _ = write!(out, "ERROR: {cmd}: pane input failed
+");
+        let _ = out.flush();
+    }
+}
+
 pub(crate) fn handle_connection(
     stream: TcpStream,
     tx: mpsc::Sender<CtrlReq>,
@@ -2287,6 +2307,9 @@ match cmd {
                     // arguments keep their exact whitespace end to end.
                     let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
                 }
+            }
+            if !paste_mode && !persistent {
+                report_failed_input(tx, &mut write_stream, "send-keys");
             }
         }
     }
@@ -6081,3 +6104,7 @@ mod tests_issue691_hook_table;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue693_targets.rs"]
 mod tests_issue693_targets;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_send_keys_input_result.rs"]
+mod tests_send_keys_input_result;

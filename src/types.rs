@@ -2797,6 +2797,10 @@ pub enum CtrlReq {
     // re-split on whitespace — that collapsed runs of spaces inside quoted
     // arguments and stripped leading/trailing spaces.
     SendKeys(Vec<String>, bool),
+    /// Answers whether the input queued before it reached the pane that
+    /// send-keys writes to: the pane writer's [`crate::pane::PaneInput::Mark`].
+    /// True where no single writer can say (a mode, a popup, sync input).
+    InputResult(mpsc::Sender<bool>),
     /// send-keys -H: hexadecimal operands already decoded to raw bytes,
     /// written to the pane verbatim.
     SendBytes(Vec<u8>),
