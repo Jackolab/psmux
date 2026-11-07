@@ -31,6 +31,12 @@ fn spawn_loop(rx: mpsc::Receiver<CtrlReq>, took: Option<bool>) -> JoinHandle<()>
                     None => std::mem::forget(reply),
                 },
                 CtrlReq::PasteBuffer(_, resp) => { let _ = resp.send(None); }
+                CtrlReq::SendKeysXRun { resp: Some(resp), .. } => {
+                    let _ = resp.send(match took {
+                        Some(false) => Err("not in a mode".to_string()),
+                        _ => Ok(()),
+                    });
+                }
                 _ => {}
             }
         }
@@ -83,4 +89,24 @@ fn send_paste_whose_write_failed_is_an_error() {
 fn paste_buffer_whose_write_failed_is_an_error() {
     assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(false)), "OK\nERROR: paste-buffer: pane input failed\n");
     assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(true)), "OK\n");
+}
+
+#[test]
+fn send_keys_hex_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("send-keys -H 68 69", Some(false)), "OK\nERROR: send-keys: pane input failed\n");
+    assert_eq!(one_shot("send-keys -H 68 69", Some(true)), "OK\n");
+}
+
+#[test]
+fn send_keys_paste_mode_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("send-keys -p hello", Some(false)), "OK\nERROR: send-keys: pane input failed\n");
+    assert_eq!(one_shot("send-keys -p hello", Some(true)), "OK\n");
+}
+
+/// -X already answers after the copy command ran: the handler waits on
+/// SendKeysXRun's reply, and a refusal is the error line.
+#[test]
+fn send_keys_x_answers_the_copy_command_outcome() {
+    assert_eq!(one_shot("send-keys -X cancel", Some(false)), "OK\nERROR: not in a mode\n");
+    assert_eq!(one_shot("send-keys -X cancel", Some(true)), "OK\n");
 }
