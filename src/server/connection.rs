@@ -77,6 +77,90 @@ impl<'a> TargetedSender<'a> {
     }
 }
 
+/// The write side of a client connection: one logical reply, one send.
+///
+/// The default `Write::write_fmt` hands every piece of a format string to
+/// `write_all` on its own, so on a TCP_NODELAY socket `write!(s, "{}\n", text)`
+/// went out as two segments (the text, then the newline) and
+/// `writeln!(s, "ERROR: {}", e)` as three, so what a reader got from one recv
+/// depended on segment timing. A reply's end is the close of the connection
+/// (one-shot) or its newline (persistent frames); one send per reply keeps the
+/// bytes a reader sees independent of timing. This wrapper formats the whole argument
+/// list into one buffer and sends it with a single `write_all`, so every
+/// `write!` / `writeln!` on a connection is one send; `write`, `write_all` and
+/// `flush` pass straight through. It derefs to the socket for the read only
+/// calls (`set_nodelay`, `shutdown`, `register_persistent_stream`), and
+/// `try_clone` hands back another `ReplyStream` so clones keep the property.
+///
+/// The second field records that a formatted reply starting with `ERROR` went
+/// out since [`ReplyStream::take_error`] last looked: the one-shot loop ends a
+/// command list there, as tmux's cmd-queue.c removes the rest of the list
+/// after a command fails. Every command error on this connection is written
+/// with `write!`/`writeln!` as an `ERROR...` line (pane text such as
+/// capture-pane's goes out with `write_all` and is not looked at).
+pub(crate) struct ReplyStream(TcpStream, bool);
+
+impl ReplyStream {
+    fn new(stream: TcpStream) -> ReplyStream {
+        ReplyStream(stream, false)
+    }
+
+    fn try_clone(&self) -> io::Result<ReplyStream> {
+        self.0.try_clone().map(ReplyStream::new)
+    }
+
+    /// Whether an error reply was written since the last call, clearing it.
+    fn take_error(&mut self) -> bool {
+        std::mem::take(&mut self.1)
+    }
+
+    fn send_reply(&mut self, text: &str) -> io::Result<()> {
+        if is_error_reply(text) {
+            self.1 = true;
+        }
+        self.0.write_all(text.as_bytes())
+    }
+
+    /// The underlying socket, for a clone that is only ever shut down.
+    fn socket(&self) -> &TcpStream {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ReplyStream {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        &self.0
+    }
+}
+
+impl Write for ReplyStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.write_all(buf)
+    }
+
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        match args.as_str() {
+            Some(s) => self.send_reply(s),
+            None => self.send_reply(&std::fmt::format(args)),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// A command's failure reply on a one-shot connection: `ERROR: <message>`, or
+/// `ERROR <message>` as the switch-client handlers answer.
+pub(crate) fn is_error_reply(text: &str) -> bool {
+    text.starts_with("ERROR")
+}
+
 /// Validate a command's -t target on the server, read only.  Ok is the
 /// target in stable id form for `TargetedSender`; Err is tmux's message and
 /// the command must not run.
@@ -751,7 +835,7 @@ const INPUT_RESULT_WAIT: Duration = Duration::from_millis(1500);
 
 /// Ask the server loop whether the input `cmd` queued reached its pane, and
 /// write an `ERROR:` line for the CLI when a pipe write failed.
-fn report_failed_input(tx: &TargetedSender<'_>, out: &mut TcpStream, cmd: &str) {
+fn report_failed_input(tx: &TargetedSender<'_>, out: &mut ReplyStream, cmd: &str) {
     let (rtx, rrx) = mpsc::channel::<bool>();
     if tx.send(CtrlReq::InputResult(rtx)).is_err() {
         return;
@@ -773,7 +857,7 @@ let client_id = crate::types::next_client_id();
 let _ = stream.set_nodelay(true);
 // Clone stream for writing, original goes into BufReader for reading
 let mut write_stream = match stream.try_clone() {
-    Ok(s) => s,
+    Ok(s) => ReplyStream::new(s),
     Err(_) => return,
 };
 // Every socket handle on this connection must be non-inheritable: the server
@@ -884,7 +968,7 @@ if line.trim() == "PERSISTENT" {
     // pressure the clone chain stays shallow.  If the clone fails here we
     // return early — the client immediately sees a closed connection and
     // reconnects, which is far better than hanging with no shutdown signal.
-    let ws_shutdown = match write_stream.try_clone() {
+    let ws_shutdown = match write_stream.socket().try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -1450,9 +1534,15 @@ let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(10)));
 let mut attached_sent = false;
 let mut pending_chain: Vec<String> = Vec::new();
 loop {
+    // A failed command ends the rest of its list (see ReplyStream::take_error).
+    if write_stream.take_error() && !persistent {
+        pending_chain.clear();
+    }
     // Check pending chained commands before reading from socket
+    let mut from_list = false;
     if !pending_chain.is_empty() {
         line = pending_chain.remove(0);
+        from_list = true;
     } else if line.trim().is_empty() {
         // Try to read another command with timeout
         line.clear();
@@ -1510,6 +1600,8 @@ loop {
     // Use quote-aware parser to preserve arguments with spaces
     // Handle command chaining (\; or ;) by splitting into sub-commands
     let sub_cmds = crate::config::split_chained_commands_pub(line.trim());
+    // This command is one of a list (`a ; b`), whose rest stops if it fails.
+    let in_command_list = from_list || sub_cmds.len() > 1;
     let effective_line: String;
     if sub_cmds.len() > 1 {
         effective_line = sub_cmds[0].clone();
@@ -1677,6 +1769,25 @@ let selectp_owns_target = matches!(cmd, "select-pane" | "selectp");
 // command has no -t, or owns it, and acts on the real focus).
 let mut command_target: Option<crate::types::TempTarget> = None;
 if is_focus_cmd {
+    // A select-pane alone on the command line had its target checked by the
+    // CLI (cli_validate_window_pane_target); one inside a list did not, and
+    // its request has no reply. Check it here so a target that names nothing
+    // is tmux's "can't find pane" and ends the list.
+    let has_target = target_win.is_some() || target_win_name.is_some() || target_pane.is_some();
+    if selectp_owns_target && !persistent && in_command_list && has_target {
+        let spec = crate::types::TempTarget {
+            win: target_win,
+            win_is_id: target_win_is_id,
+            win_name: target_win_name.clone(),
+            pane: target_pane,
+            pane_is_id,
+        };
+        if let Err(e) = validate_target(&tx, spec) {
+            let _ = writeln!(write_stream, "ERROR: {}", e);
+            let _ = write_stream.flush();
+            break;
+        }
+    }
     if selectp_owns_target {
         for req in select_pane_requests(
             &args, raw_target.as_deref(), target_win, target_win_is_id,
@@ -1780,7 +1891,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
         }
@@ -1831,7 +1942,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title, env_sets, zoom_after_split));
@@ -1892,7 +2003,7 @@ match cmd {
                     let _ = write_stream.write_all(text.as_bytes());
                     let _ = write_stream.flush();
                 }
-                if !persistent { break; }
+                if !persistent && pending_chain.is_empty() { break; }
             } else {
                 let _ = tx.send(CtrlReq::SetBuffer(text));
             }
@@ -1909,7 +2020,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "dump-state" | "dump" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -1924,7 +2035,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); 
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         }
     }
     "send-text" => {
@@ -2114,9 +2225,9 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
-    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } } if !persistent { break; } }
+    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { if persistent { let _ = tx.send(CtrlReq::ShowTextPopup("list-tree".to_string(), text)); } else { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); } } if !persistent && pending_chain.is_empty() { break; } }
     "window-layout" => {
         // Issue #257: return simplified layout JSON for a given window id.
         // Usage: window-layout <window_id>
@@ -2132,7 +2243,7 @@ match cmd {
             let _ = write!(write_stream, "{{}}\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "window-dump" => {
         // Return a fully styled LayoutJson, or the layout plus preview styles
@@ -2155,7 +2266,7 @@ match cmd {
             let _ = write!(write_stream, "{{}}\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
@@ -2411,7 +2522,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "kill-window" | "killw" => {
         // Resolve the -t target server-side. The generic temp-focus block is
@@ -2689,7 +2800,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "show-buffer" | "showb" => {
         let buf_name: Option<String> = args.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
@@ -2711,7 +2822,7 @@ match cmd {
         } else {
             let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "delete-buffer" => {
         let buf_name: Option<String> = args.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
@@ -2749,7 +2860,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "display-message" | "display" => {
         // Parse tmux-like display-message flags without dropping message text.
@@ -2818,7 +2929,7 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
     "last-pane" | "lastp" => {
@@ -2965,7 +3076,7 @@ match cmd {
             let _ = write!(write_stream, "ERR timeout\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-inject" => {
         // Usage: pane-forward-inject <src_session> <src_addr> <src_key> <fwd_id> <fwd_port>
@@ -3011,7 +3122,7 @@ match cmd {
             let _ = write!(write_stream, "ERR not enough args\n");
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-resize" => {
         // Usage: pane-forward-resize <forward_id> <rows> <cols>
@@ -3023,7 +3134,7 @@ match cmd {
             let _ = write!(write_stream, "OK\n");
         }
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-status" => {
         // Usage: pane-forward-status <forward_id>
@@ -3036,7 +3147,7 @@ match cmd {
             let _ = write!(write_stream, "exited\n");
         }
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pane-forward-kill" => {
         // Usage: pane-forward-kill <forward_id>
@@ -3044,7 +3155,7 @@ match cmd {
         let _ = tx.send(CtrlReq::PaneForwardKill(fwd_id));
         let _ = write!(write_stream, "OK\n");
         let _ = write_stream.flush();
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "session-info" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -3060,7 +3171,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", line); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "client-attach" => {
         if !attached_sent {
@@ -3210,7 +3321,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", filtered); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "set-option" | "set" | "set-window-option" | "setw" => {
         // Flags parse only BEFORE the first positional, and `--` ends option
@@ -3476,7 +3587,7 @@ match cmd {
                     let _ = write_stream.flush();
                 }
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
             continue;
         }
         let opt_name: Option<&str> = args.iter()
@@ -3623,7 +3734,7 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "source-file" | "source" => {
         let format_expand = args.iter().any(|a| *a == "-F");
@@ -3753,7 +3864,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "pipe-pane" | "pipep" => {
         let stdin_flag = args.iter().any(|a| *a == "-I");
@@ -3817,7 +3928,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "switch-client" | "switchc" => {
         let has_big_t = args.windows(2).any(|w| w[0] == "-T");
@@ -3869,7 +3980,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "lock-client" | "lockc" => {
         let _ = tx.send(CtrlReq::LockClient);
@@ -3938,7 +4049,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "set-hook" => {
         // Same positional discipline as set-option (#583): flags parse only
@@ -4002,7 +4113,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "wait-for" => {
         let lock = args.iter().any(|a| *a == "-L");
@@ -4062,7 +4173,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text);
                 let _ = write_stream.flush();
             }
-            if !persistent { break; }
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let _ = tx.send(CtrlReq::NewFloat { command: p.command, x: p.x, y: p.y, w: p.w, h: p.h, border: p.border, title: p.title, start_dir: p.start_dir, detached: p.detached, empty: p.empty, resp: None });
         }
@@ -4183,7 +4294,7 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "copy-mode" => {
         // `-q` leaves, `-H` hides the position indicator for this entry only
@@ -4261,7 +4372,7 @@ match cmd {
         if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
             let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "show-messages" | "showmsgs" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -4273,7 +4384,7 @@ match cmd {
                 let _ = write!(write_stream, "{}", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "command-prompt" => {
         let initial = args.windows(2).find(|w| w[0] == "-I").map(|w| w[1].to_string()).unwrap_or_default();
@@ -4481,7 +4592,7 @@ match cmd {
                 }
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "new-session" | "new" => {
         // new-session -t target: set session group on this server
@@ -4653,7 +4764,7 @@ match cmd {
             let _ = write!(write_stream, "{}\n", cmds);
             let _ = write_stream.flush();
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "server-info" | "info" => {
         let (rtx, rrx) = mpsc::channel::<String>();
@@ -4665,11 +4776,11 @@ match cmd {
                 let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "start-server" => {
         // Server is already running if we're here, no-op
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "send-prefix" => {
         let _ = tx.send(CtrlReq::SendPrefix);
@@ -4755,7 +4866,7 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     "customize-mode" => {
         // tmux 3.2+ customize-mode: interactive options editor
@@ -4784,14 +4895,22 @@ match cmd {
                 let _ = write_stream.flush();
             }
         }
-        if !persistent { break; }
+        if !persistent && pending_chain.is_empty() { break; }
     }
     _ => {}
 }
 }
-    // Process pending chained commands before reading from socket
+    // Process pending chained commands before reading from socket. A command
+    // that answered with an error ends the list there, as tmux's cmd-queue.c
+    // removes the rest of a command list after CMD_RETURN_ERROR.
+    if write_stream.take_error() && !persistent {
+        pending_chain.clear();
+    }
+    // The next command is taken at the top of the loop. Taking it here as
+    // well skipped every other command of a list of three or more: this one
+    // was overwritten there by the one after it.
     if !pending_chain.is_empty() {
-        line = pending_chain.remove(0);
+        line.clear();
         continue;
     }
     // Try to read next command for batching (with timeout)
@@ -6114,3 +6233,11 @@ mod tests_issue693_targets;
 #[cfg(test)]
 #[path = "../../tests-rs/test_send_keys_input_result.rs"]
 mod tests_send_keys_input_result;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_reply_stream_error.rs"]
+mod tests_reply_stream_error;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_command_list_runs_whole.rs"]
+mod tests_command_list_runs_whole;
