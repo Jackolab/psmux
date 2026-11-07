@@ -6237,3 +6237,7 @@ mod tests_send_keys_input_result;
 #[cfg(test)]
 #[path = "../../tests-rs/test_reply_stream_error.rs"]
 mod tests_reply_stream_error;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_command_list_runs_whole.rs"]
+mod tests_command_list_runs_whole;
