@@ -2359,6 +2359,9 @@ match cmd {
                 for _ in 0..repeat_count {
                     let _ = tx.send(CtrlReq::SendBytes(bytes.clone()));
                 }
+                if !persistent {
+                    report_failed_input(tx, &mut write_stream, "send-keys");
+                }
             }
         } else if has_x {
             // send-keys -X copy-mode-command
@@ -2421,7 +2424,7 @@ match cmd {
                     let _ = tx.send(CtrlReq::SendKeys(keys.clone(), effective_literal));
                 }
             }
-            if !paste_mode && !persistent {
+            if !persistent {
                 report_failed_input(tx, &mut write_stream, "send-keys");
             }
         }
