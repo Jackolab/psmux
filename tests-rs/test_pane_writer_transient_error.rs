@@ -136,7 +136,9 @@ fn writes_after_a_failure_are_consumed_without_delivery_or_release() {
 
     let mut queue = spawn_pane_write_queue(Box::new(inner));
     assert_eq!(queue.write(b"boom").unwrap(), 4); // fails inside the thread
-    assert_eq!(queue.write(b"after").unwrap(), 5); // consumed, not delivered
+    // Queued or refused, depending on whether the thread has failed yet;
+    // never delivered either way.
+    let _ = queue.write(b"after");
 
     assert!(
         wait_until("failure attempted", || attempts.load(Ordering::SeqCst) >= 1, Duration::from_secs(5))
@@ -185,7 +187,9 @@ fn writes_before_the_failure_are_delivered() {
     );
 
     assert_eq!(queue.write(b"boom").unwrap(), 4); // fails inside the thread
-    assert_eq!(queue.write(b"after").unwrap(), 5); // consumed, not delivered
+    // Queued or refused, depending on whether the thread has failed yet;
+    // never delivered either way.
+    let _ = queue.write(b"after");
 
     assert!(
         wait_until("failure attempted", || attempts.load(Ordering::SeqCst) >= 2, Duration::from_secs(5))
@@ -198,6 +202,44 @@ fn writes_before_the_failure_are_delivered() {
     );
     assert_eq!(*bytes.lock(), b"ok".to_vec(), "only the pre-failure write may be delivered");
     assert!(!dropped.load(Ordering::SeqCst), "writer must stay alive after the failure");
+
+    drop(queue);
+    assert!(wait_until("thread exits on queue drop", || dropped.load(Ordering::SeqCst), Duration::from_secs(5)));
+}
+
+/// Once the writer thread has marked the pane broken, a later write or paste
+/// is refused (BrokenPipe, the job handed back) instead of being acked and
+/// then dropped, so the caller can tell the input never reached the child.
+#[test]
+fn a_write_after_the_writer_broke_fails_instead_of_acking() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let inner = FailOnNthWriter {
+        fail_on: 1,
+        attempts: attempts.clone(),
+        bytes: bytes.clone(),
+        dropped: dropped.clone(),
+    };
+
+    let mut queue = spawn_pane_write_queue(Box::new(inner));
+    assert_eq!(queue.write(b"boom").unwrap(), 4, "the failing write was queued before the failure");
+    assert!(
+        wait_until("failure attempted", || attempts.load(Ordering::SeqCst) >= 1, Duration::from_secs(5))
+    );
+
+    let refused = wait_until(
+        "a later write is refused",
+        || queue.write(b"after").is_err(),
+        Duration::from_secs(5),
+    );
+    assert!(refused, "a write to a broken pane must fail, not ack");
+    let err = queue.write(b"again").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    let job = InjectPaste { pid: 0, text: "paste".to_string(), normalize: false };
+    assert!(queue.queue_inject_paste(job).is_err(), "a paste to a broken pane must be handed back");
+    assert!(bytes.lock().is_empty(), "nothing reaches the broken inner writer");
+    assert!(!dropped.load(Ordering::SeqCst), "the writer still owns the PTY handle");
 
     drop(queue);
     assert!(wait_until("thread exits on queue drop", || dropped.load(Ordering::SeqCst), Duration::from_secs(5)));
