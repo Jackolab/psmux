@@ -84,3 +84,15 @@ fn paste_buffer_whose_write_failed_is_an_error() {
     assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(false)), "OK\nERROR: paste-buffer: pane input failed\n");
     assert_eq!(one_shot("paste-buffer -b tenax-paste-1", Some(true)), "OK\n");
 }
+
+#[test]
+fn send_keys_hex_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("send-keys -H 68 69", Some(false)), "OK\nERROR: send-keys: pane input failed\n");
+    assert_eq!(one_shot("send-keys -H 68 69", Some(true)), "OK\n");
+}
+
+#[test]
+fn send_keys_paste_mode_whose_write_failed_is_an_error() {
+    assert_eq!(one_shot("send-keys -p hello", Some(false)), "OK\nERROR: send-keys: pane input failed\n");
+    assert_eq!(one_shot("send-keys -p hello", Some(true)), "OK\n");
+}
