@@ -48,6 +48,14 @@ struct QueuedPaneWriter {
     /// discarded instead of being written to a pane that no longer exists,
     /// the way tmux frees a closing pane's bufferevent with its pending output.
     closed: Arc<AtomicBool>,
+    /// Set by the writer thread when a write to the pane's input pipe has
+    /// failed.  Later writes and pastes are refused from then on, so a
+    /// caller learns its input will not reach the child instead of an ack.
+    broken: Arc<AtomicBool>,
+}
+
+fn broken_pane() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pane input pipe is broken")
 }
 
 impl Drop for QueuedPaneWriter {
@@ -60,6 +68,9 @@ impl std::io::Write for QueuedPaneWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.broken.load(Ordering::Acquire) {
+            return Err(broken_pane());
         }
         self.tx.send(PaneInput::Bytes(buf.to_vec())).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pane writer thread exited")
@@ -74,6 +85,9 @@ impl std::io::Write for QueuedPaneWriter {
 
 impl PaneInputSink for QueuedPaneWriter {
     fn queue_inject_paste(&mut self, job: InjectPaste) -> Result<(), InjectPaste> {
+        if self.broken.load(Ordering::Acquire) {
+            return Err(job);
+        }
         self.tx.send(PaneInput::InjectPaste(job)).map_err(|e| match e.0 {
             PaneInput::InjectPaste(job) => job,
             PaneInput::Bytes(_) => unreachable!("sent an InjectPaste"),
@@ -306,10 +320,11 @@ pub(crate) fn spawn_pane_write_queue_with(
     let (tx, rx) = std::sync::mpsc::channel::<PaneInput>();
     let closed = Arc::new(AtomicBool::new(false));
     let closed_rx = closed.clone();
+    let broken = Arc::new(AtomicBool::new(false));
+    let broken_tx = broken.clone();
     let _ = std::thread::Builder::new()
         .name("pane-writer".to_string())
         .spawn(move || {
-            let mut broken = false;
             // An item taken while coalescing that is not bytes: it is next.
             let mut next: Option<PaneInput> = None;
             loop {
@@ -335,11 +350,11 @@ pub(crate) fn spawn_pane_write_queue_with(
                                 Err(_) => break,
                             }
                         }
-                        if broken || closed_rx.load(Ordering::Acquire) {
+                        if broken_tx.load(Ordering::Acquire) || closed_rx.load(Ordering::Acquire) {
                             continue;
                         }
                         if inner.write_all(&buf).is_err() {
-                            broken = true;
+                            broken_tx.store(true, Ordering::Release);
                             continue;
                         }
                         let _ = inner.flush();
@@ -367,17 +382,17 @@ pub(crate) fn spawn_pane_write_queue_with(
                                 r.consumed, job.text.len() + 12
                             ),
                         );
-                        if broken {
+                        if broken_tx.load(Ordering::Acquire) {
                             continue;
                         }
                         if !crate::input::write_paste_remainder(&mut *inner, &job.text, r.consumed, job.normalize) {
-                            broken = true;
+                            broken_tx.store(true, Ordering::Release);
                         }
                     }
                 }
             }
         });
-    Box::new(QueuedPaneWriter { tx, closed })
+    Box::new(QueuedPaneWriter { tx, closed, broken })
 }
 
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.

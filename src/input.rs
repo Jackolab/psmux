@@ -3085,7 +3085,8 @@ pub(crate) fn write_paste_remainder(writer: &mut dyn std::io::Write, text: &str,
 fn write_paste_parts(writer: &mut dyn std::io::Write, open: &[u8], text: &[u8], close: &[u8], normalize: bool) -> bool {
     // Append to the slice, handing each full slice to the writer.  False once
     // a write fails, which means the pane writer thread is gone (the pane is
-    // closing) and the rest of the paste has nowhere to go.
+    // closing) or its input pipe broke, and the rest of the paste has nowhere
+    // to go.
     fn push(writer: &mut dyn std::io::Write, slice: &mut Vec<u8>, mut bytes: &[u8]) -> bool {
         while !bytes.is_empty() {
             let take = (PASTE_SLICE - slice.len()).min(bytes.len());
