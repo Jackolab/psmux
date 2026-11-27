@@ -63,7 +63,7 @@ use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedP
 use crate::platform::enable_virtual_terminal_processing;
 use crate::cli::{print_help, print_version, print_commands};
 use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control, send_control_confirmed,
-    send_control_with_response, resolve_default_session_name};
+    send_control_with_response, send_control_until_reply, resolve_default_session_name};
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
@@ -4338,7 +4338,7 @@ fn run_main() -> io::Result<()> {
                         send_control(format!("wait-for -U {}\n", ch))?;
                     } else {
                         // Wait for channel - this blocks
-                        let resp = send_control_with_response(format!("wait-for {}\n", ch))?;
+                        let resp = send_control_until_reply(format!("wait-for {}\n", ch))?;
                         if !resp.is_empty() {
                             print!("{}", resp);
                         }

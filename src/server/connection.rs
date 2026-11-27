@@ -4127,7 +4127,14 @@ match cmd {
             else if signal { WaitForOp::Signal }
             else if unlock { WaitForOp::Unlock }
             else { WaitForOp::Wait };
-        let _ = tx.send(CtrlReq::WaitFor(channel, op));
+        if matches!(op, WaitForOp::Wait) {
+            // The client's reply waits for the signal; a server that exits drops the sender.
+            let (wtx, wrx) = mpsc::channel::<()>();
+            let _ = tx.send(CtrlReq::WaitFor(channel, op, Some(wtx)));
+            let _ = wrx.recv();
+        } else {
+            let _ = tx.send(CtrlReq::WaitFor(channel, op, None));
+        }
     }
     "display-menu" | "menu" => {
         let mut x_pos: Option<i16> = None;
@@ -6028,7 +6035,13 @@ fn dispatch_control_command(
                      else if args.iter().any(|a| *a == "-S") { WaitForOp::Signal }
                      else { WaitForOp::Wait };
             if let Some(channel) = args.iter().find(|a| !a.starts_with('-')) {
-                let _ = tx.send(CtrlReq::WaitFor(channel.to_string(), op));
+                if matches!(op, WaitForOp::Wait) {
+                    let (wtx, wrx) = mpsc::channel::<()>();
+                    let _ = tx.send(CtrlReq::WaitFor(channel.to_string(), op, Some(wtx)));
+                    let _ = wrx.recv();
+                } else {
+                    let _ = tx.send(CtrlReq::WaitFor(channel.to_string(), op, None));
+                }
             }
             let _ = resp_tx.send(String::new());
             true

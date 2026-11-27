@@ -7160,35 +7160,37 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::KillServer => {
                     shutdown_this_server(&mut app);
                 }
-                CtrlReq::WaitFor(channel, op) => {
+                CtrlReq::WaitFor(channel, op, reply) => {
+                    let entry = app.wait_channels.entry(channel).or_insert_with(|| WaitChannel {
+                        locked: false,
+                        woken: false,
+                        waiters: Vec::new(),
+                    });
                     match op {
-                        WaitForOp::Lock => {
-                            let entry = app.wait_channels.entry(channel).or_insert_with(|| WaitChannel {
-                                locked: false,
-                                waiters: Vec::new(),
-                            });
-                            entry.locked = true;
-                        }
+                        WaitForOp::Lock => entry.locked = true,
                         WaitForOp::Unlock => {
-                            if let Some(ch) = app.wait_channels.get_mut(&channel) {
-                                ch.locked = false;
-                                for waiter in ch.waiters.drain(..) {
-                                    let _ = waiter.send(());
-                                }
+                            entry.locked = false;
+                            for waiter in entry.waiters.drain(..) {
+                                let _ = waiter.send(());
                             }
                         }
                         WaitForOp::Signal => {
-                            if let Some(ch) = app.wait_channels.get_mut(&channel) {
-                                for waiter in ch.waiters.drain(..) {
-                                    let _ = waiter.send(());
-                                }
+                            if entry.waiters.is_empty() {
+                                entry.woken = true;
+                            }
+                            for waiter in entry.waiters.drain(..) {
+                                let _ = waiter.send(());
                             }
                         }
                         WaitForOp::Wait => {
-                            app.wait_channels.entry(channel).or_insert_with(|| WaitChannel {
-                                locked: false,
-                                waiters: Vec::new(),
-                            });
+                            if let Some(reply) = reply {
+                                if entry.woken {
+                                    entry.woken = false;
+                                    let _ = reply.send(());
+                                } else {
+                                    entry.waiters.push(reply);
+                                }
+                            }
                         }
                     }
                 }

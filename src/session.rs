@@ -2464,6 +2464,16 @@ pub(crate) fn drain_barrier(stream: &mut std::net::TcpStream) -> io::Result<()> 
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
+    request_reply(line, Some(Duration::from_millis(3000)))
+}
+
+/// A request whose reply comes when the server has one, however long that takes
+/// (`wait-for`): no read timeout; the server's exit ends the read.
+pub fn send_control_until_reply(line: String) -> io::Result<String> {
+    request_reply(line, None)
+}
+
+fn request_reply(line: String, read_timeout: Option<Duration>) -> io::Result<String> {
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
@@ -2487,7 +2497,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+    let _ = stream.set_read_timeout(read_timeout);
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
