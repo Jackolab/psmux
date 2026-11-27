@@ -1075,6 +1075,8 @@ pub struct PipePaneState {
 /// Wait-for channel state
 pub struct WaitChannel {
     pub locked: bool,
+    /// A signal that came with no waiter, latched for the next wait (tmux's `woken`).
+    pub woken: bool,
     pub waiters: Vec<mpsc::Sender<()>>,
 }
 
@@ -3239,7 +3241,8 @@ pub enum CtrlReq {
     /// client's socket — its `-L` namespace, or the default one — and then this
     /// one. `true` is `-a`, the psmux-only sweep of every namespace (#649).
     KillServerScoped(bool),
-    WaitFor(String, WaitForOp),
+    /// A plain wait carries the sender its client blocks on until the channel is signalled.
+    WaitFor(String, WaitForOp, Option<mpsc::Sender<()>>),
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayMenuDirect(Menu),
     DisplayPopup(String, String, String, bool, Option<String>),
