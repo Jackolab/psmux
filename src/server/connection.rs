@@ -1072,17 +1072,18 @@ if line.trim() == "PERSISTENT" {
 }
 
 // Check for CONTROL or CONTROL_NOECHO (control mode)
-let mut hello = line.split_whitespace();
-let mode_word = hello.next().unwrap_or("");
-let client_pid: Option<u32> = hello.next().and_then(|p| p.parse().ok());
-let control_echo = mode_word == "CONTROL";
-let control_noecho = mode_word == "CONTROL_NOECHO";
+let control_echo = line.trim() == "CONTROL";
+let control_noecho = line.trim() == "CONTROL_NOECHO";
 if control_echo || control_noecho {
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
 
     let ctrl_client_id = crate::types::next_client_id();
+    let client_pid = match (r.get_ref().peer_addr(), r.get_ref().local_addr()) {
+        (Ok(peer), Ok(local)) => crate::platform::process_kill::loopback_peer_pid(peer.port(), local.port()),
+        _ => None,
+    };
     crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
 
     let (notif_tx, notif_rx) = std::sync::mpsc::sync_channel::<ControlNotification>(4096);
