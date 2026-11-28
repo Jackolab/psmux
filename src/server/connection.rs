@@ -1080,6 +1080,10 @@ if control_echo || control_noecho {
     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
 
     let ctrl_client_id = crate::types::next_client_id();
+    let client_pid = match (r.get_ref().peer_addr(), r.get_ref().local_addr()) {
+        (Ok(peer), Ok(local)) => crate::platform::process_kill::loopback_peer_pid(peer.port(), local.port()),
+        _ => None,
+    };
     crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
 
     let (notif_tx, notif_rx) = std::sync::mpsc::sync_channel::<ControlNotification>(4096);
@@ -1151,6 +1155,7 @@ if control_echo || control_noecho {
     let _ = tx.send(CtrlReq::ControlRegister {
         client_id: ctrl_client_id,
         echo: control_echo,
+        pid: client_pid,
         notif_tx: notif_tx,
     });
 

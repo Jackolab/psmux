@@ -3678,6 +3678,7 @@ pub mod process_kill {
 
     const AF_INET: u32 = 2;
     const TCP_TABLE_OWNER_PID_LISTENER: u32 = 3;
+    const TCP_TABLE_OWNER_PID_CONNECTIONS: u32 = 4;
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     /// 127.0.0.1 as a native-endian u32 (bytes 127,0,0,1 in the on-wire order the
     /// TCP table stores dwLocalAddr in). psmux servers always bind 127.0.0.1, so
@@ -3690,49 +3691,56 @@ pub mod process_kill {
     /// sockets are returned — a psmux *client* never listens, so clients can never
     /// appear here and are structurally safe from the reaper.
     pub fn loopback_listener_pids() -> Vec<(u32, u16)> {
+        tcp_owner_rows(TCP_TABLE_OWNER_PID_LISTENER)
+            .into_iter()
+            .filter(|r| r[1] == LOOPBACK_ADDR)
+            .map(|r| (r[5], net_port(r[2])))
+            .collect()
+    }
+
+    /// The pid that owns the loopback connection whose local end is
+    /// `peer_port` and whose remote end is `server_port`: the process on the
+    /// other side of a connection this server accepted.
+    pub fn loopback_peer_pid(peer_port: u16, server_port: u16) -> Option<u32> {
+        tcp_owner_rows(TCP_TABLE_OWNER_PID_CONNECTIONS)
+            .into_iter()
+            .find(|r| r[1] == LOOPBACK_ADDR && net_port(r[2]) == peer_port && net_port(r[4]) == server_port)
+            .map(|r| r[5])
+    }
+
+    /// dwLocalPort/dwRemotePort hold the port in network byte order in the low 16 bits.
+    fn net_port(raw: u32) -> u16 {
+        (((raw & 0xff) << 8) | ((raw >> 8) & 0xff)) as u16
+    }
+
+    /// MIB_TCPROW_OWNER_PID rows as [state, localAddr, localPort, remoteAddr, remotePort, owningPid].
+    fn tcp_owner_rows(table_class: u32) -> Vec<[u32; 6]> {
         let mut out = Vec::new();
         unsafe {
             let mut size: u32 = 0;
-            // First call sizes the buffer.
-            let _ = GetExtendedTcpTable(
-                std::ptr::null_mut(), &mut size, 0, AF_INET,
-                TCP_TABLE_OWNER_PID_LISTENER, 0,
-            );
+            let _ = GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, AF_INET, table_class, 0);
             if size == 0 { return out; }
             let mut buf = vec![0u8; size as usize];
             let mut attempts = 0;
-            let mut ret = GetExtendedTcpTable(
-                buf.as_mut_ptr(), &mut size, 0, AF_INET,
-                TCP_TABLE_OWNER_PID_LISTENER, 0,
-            );
-            // The table can grow between the sizing and filling calls; retry a
-            // couple of times on ERROR_INSUFFICIENT_BUFFER with the new size.
+            let mut ret = GetExtendedTcpTable(buf.as_mut_ptr(), &mut size, 0, AF_INET, table_class, 0);
+            // The table can grow between the sizing and filling calls.
             while ret == ERROR_INSUFFICIENT_BUFFER && attempts < 3 {
                 buf.resize(size as usize, 0);
-                ret = GetExtendedTcpTable(
-                    buf.as_mut_ptr(), &mut size, 0, AF_INET,
-                    TCP_TABLE_OWNER_PID_LISTENER, 0,
-                );
+                ret = GetExtendedTcpTable(buf.as_mut_ptr(), &mut size, 0, AF_INET, table_class, 0);
                 attempts += 1;
             }
             if ret != 0 { return out; }
-
-            // MIB_TCPTABLE_OWNER_PID: u32 dwNumEntries, then rows.
-            // MIB_TCPROW_OWNER_PID (24 bytes): state, localAddr, localPort,
-            // remoteAddr, remotePort, owningPid — each a u32.
             let base = buf.as_ptr();
             let num = (base as *const u32).read_unaligned() as usize;
             const ROW: usize = 24;
             for i in 0..num {
-                let row = base.add(4 + i * ROW);
                 if 4 + i * ROW + ROW > buf.len() { break; }
-                let local_addr = (row.add(4) as *const u32).read_unaligned();
-                if local_addr != LOOPBACK_ADDR { continue; }
-                let local_port_raw = (row.add(8) as *const u32).read_unaligned();
-                // dwLocalPort is network byte order in the low 16 bits.
-                let port = (((local_port_raw & 0xff) << 8) | ((local_port_raw >> 8) & 0xff)) as u16;
-                let pid = (row.add(20) as *const u32).read_unaligned();
-                out.push((pid, port));
+                let row = base.add(4 + i * ROW);
+                let mut r = [0u32; 6];
+                for (k, v) in r.iter_mut().enumerate() {
+                    *v = (row.add(k * 4) as *const u32).read_unaligned();
+                }
+                out.push(r);
             }
         }
         out
@@ -3788,6 +3796,7 @@ pub mod process_kill {
 
     // Orphaned-server reaper stubs (issue #448) — no-ops off Windows.
     pub fn loopback_listener_pids() -> Vec<(u32, u16)> { Vec::new() }
+    pub fn loopback_peer_pid(_peer_port: u16, _server_port: u16) -> Option<u32> { None }
     pub fn now_process_filetime() -> u64 { 0 }
     pub fn process_creation_time(_pid: u32) -> Option<u64> { None }
     pub fn terminate_server_pid(_pid: u32, _max_creation_ft: Option<u64>) {}

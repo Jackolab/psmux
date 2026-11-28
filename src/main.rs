@@ -4453,7 +4453,10 @@ fn run_main() -> io::Result<()> {
             }
             // list-clients - List all clients
             "list-clients" | "lsc" => {
-                let resp = send_control_with_response("list-clients\n".to_string())?;
+                let mut cmd = "list-clients".to_string();
+                for a in &cmd_args[1..] { cmd.push(' '); cmd.push_str(&crate::util::quote_arg(a)); }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
                 print!("{}", resp);
                 return Ok(());
             }
