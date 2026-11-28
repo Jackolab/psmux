@@ -5744,7 +5744,7 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     // Send CONTROL or CONTROL_NOECHO
     let mode_str = if mode == 1 { "CONTROL" } else { "CONTROL_NOECHO" };
     let mut write_stream = reader.get_ref().try_clone()?;
-    write!(write_stream, "{} {}\n", mode_str, std::process::id())?;
+    write!(write_stream, "{}\n", mode_str)?;
     write_stream.flush()?;
     cclog!("{} sent, starting I/O threads", mode_str);
 
