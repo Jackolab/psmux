@@ -3929,6 +3929,20 @@ impl ColorQueryScanner {
     }
 }
 
+/// Appends a parsed batch to a pane's control mode %output ring, dropping the
+/// oldest bytes past 64 KiB.
+fn push_output_ring(ring: &Mutex<std::collections::VecDeque<u8>>, bytes: &[u8]) {
+    const MAX_RING: usize = 65536;
+    if let Ok(mut ring) = ring.lock() {
+        let space = MAX_RING.saturating_sub(ring.len());
+        if bytes.len() > space {
+            let drop_count = (bytes.len() - space).min(ring.len());
+            ring.drain(..drop_count);
+        }
+        ring.extend(bytes);
+    }
+}
+
 // TODO: The 8 Arc parameters below should be grouped into a `ReaderSignals`
 // struct the next time a new signal is added, to keep the call-site manageable.
 pub fn spawn_reader_thread(
@@ -3982,7 +3996,6 @@ pub fn spawn_reader_thread(
     // ── Reader thread: pure I/O, no parser lock ──
     let staging_r = staging.clone();
     let reader_done_r = reader_done.clone();
-    let output_ring_r = output_ring.clone();
     thread::spawn(move || {
         // TEST-ONLY (PSMUX_TEST_READER_DELAY_MS): hold off this reader's first
         // read by a fixed duration. The reader is what drains conhost's startup
@@ -4081,19 +4094,6 @@ pub fn spawn_reader_thread(
                             crate::platform::mouse_inject::log_lost_reply(
                                 child_pid, "XTVERSION", reply.len(),
                             );
-                        }
-                    }
-                    // Append raw output to ring buffer for control mode %output.
-                    // This is independent of parser state and must stay live.
-                    if let Ok(mut ring) = output_ring_r.lock() {
-                        const MAX_RING: usize = 65536;
-                        let space = MAX_RING.saturating_sub(ring.len());
-                        if n <= space {
-                            ring.extend(&local[..n]);
-                        } else {
-                            let drop_count = (n - space).min(ring.len());
-                            ring.drain(..drop_count);
-                            ring.extend(&local[..n]);
                         }
                     }
                     // Issue #440: tee raw pane output to any registered pipe-pane
@@ -4282,6 +4282,10 @@ pub fn spawn_reader_thread(
                     crate::types::publish_pane_palette(pane_id, entries);
                 }
             }
+            // Control mode %output carries only bytes the screen already
+            // holds, so a capture-pane sent after a client saw them shows them
+            // (tmux order).
+            push_output_ring(&output_ring, &bytes);
             // When TUI sends RMCUP, reset cursor shape so it doesn't
             // persist from the exiting TUI app.
             if rmcup {
@@ -4321,6 +4325,10 @@ pub fn spawn_reader_thread(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_tenax8456_output_after_parse.rs"]
+mod test_tenax8456_output_after_parse;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue597_xtversion_reply.rs"]
