@@ -2464,16 +2464,18 @@ pub(crate) fn drain_barrier(stream: &mut std::net::TcpStream) -> io::Result<()> 
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
-    request_reply(line, Some(Duration::from_millis(3000)))
+    request_reply(line, Some(Duration::from_millis(3000)), true)
 }
 
 /// A request whose reply comes when the server has one, however long that takes
-/// (`wait-for`): no read timeout; the server's exit ends the read.
+/// (`wait-for`): no read timeout, and the write side stays open so the server can
+/// tell this client is still there (a dead one's socket reads EOF); the server
+/// closes the connection when it replies, and its exit ends the read.
 pub fn send_control_until_reply(line: String) -> io::Result<String> {
-    request_reply(line, None)
+    request_reply(line, None, false)
 }
 
-fn request_reply(line: String, read_timeout: Option<Duration>) -> io::Result<String> {
+fn request_reply(line: String, read_timeout: Option<Duration>, half_close: bool) -> io::Result<String> {
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
         eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
@@ -2507,7 +2509,9 @@ fn request_reply(line: String, read_timeout: Option<Duration>) -> io::Result<Str
     // Half-close so the server sees EOF after our request and closes the socket
     // once the reply is complete — giving a definitive Ok(0) end-of-response
     // instead of relying on an idle-gap timeout to guess the reply is done.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    if half_close {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     let mut timed_out = false;

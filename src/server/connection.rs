@@ -846,6 +846,19 @@ fn report_failed_input(tx: &TargetedSender<'_>, out: &mut ReplyStream, cmd: &str
     }
 }
 
+/// Whether a waiting client is gone. A `wait-for` client keeps its write side
+/// open and sends nothing more, so EOF, a reset or an abort means it died.
+fn client_gone(stream: &TcpStream) -> bool {
+    let _ = stream.set_nonblocking(true);
+    let mut byte = [0u8; 1];
+    let gone = match stream.peek(&mut byte) {
+        Ok(n) => n == 0,
+        Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    gone
+}
+
 pub(crate) fn handle_connection(
     stream: TcpStream,
     tx: mpsc::Sender<CtrlReq>,
@@ -4130,8 +4143,13 @@ match cmd {
         if matches!(op, WaitForOp::Wait) {
             // The client's reply waits for the signal; a server that exits drops the sender.
             let (wtx, wrx) = mpsc::channel::<()>();
-            let _ = tx.send(CtrlReq::WaitFor(channel, op, Some(wtx)));
-            let _ = wrx.recv();
+            let _ = tx.send(CtrlReq::WaitFor(channel.clone(), op, Some(wtx)));
+            if wrx.recv().is_ok() && client_gone(write_stream.socket()) {
+                // The client left while it waited, so it cannot take the signal: pass it on.
+                let _ = tx.send(CtrlReq::WaitFor(channel, WaitForOp::Signal, None));
+            }
+            // The client keeps its write side open while it waits: close here.
+            if !persistent && pending_chain.is_empty() { break; }
         } else {
             let _ = tx.send(CtrlReq::WaitFor(channel, op, None));
         }

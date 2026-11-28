@@ -7175,11 +7175,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             }
                         }
                         WaitForOp::Signal => {
-                            if entry.waiters.is_empty() {
-                                entry.woken = true;
-                            }
+                            // A waiter whose client went away cannot take the signal:
+                            // latch it unless some live waiter did.
+                            let mut taken = false;
                             for waiter in entry.waiters.drain(..) {
-                                let _ = waiter.send(());
+                                taken |= waiter.send(()).is_ok();
+                            }
+                            if !taken {
+                                entry.woken = true;
                             }
                         }
                         WaitForOp::Wait => {

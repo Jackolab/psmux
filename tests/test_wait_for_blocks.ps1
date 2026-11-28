@@ -35,6 +35,16 @@ $t = [Diagnostics.Stopwatch]::StartNew(); $done2 = $w2.WaitForExit(10000)
 "$Tag b: latched-wait-returned=$done2 in $($t.ElapsedMilliseconds) ms"
 if (-not $done2) { $script:failed++ }
 if (-not $done2) { $w2.Kill() }
+# d: a waiter killed before the signal does not swallow it: the next wait returns
+$dead = Start-Waiter 'chD'
+$deadAlive = -not $dead.WaitForExit(1000)
+$dead.Kill(); $dead.WaitForExit(10000) | Out-Null
+& $Exe -L $L wait-for -S chD | Out-Null
+$w4 = Start-Waiter 'chD'
+$done4 = $w4.WaitForExit(10000)
+"$Tag d: waiter-was-blocked=$deadAlive later-wait-got-the-signal=$done4"
+if (-not ($deadAlive -and $done4)) { $script:failed++ }
+if (-not $done4) { $w4.Kill() }
 # c: the server's exit releases a waiter
 $w3 = Start-Waiter 'chC'
 $alive3 = -not $w3.WaitForExit(1000)
