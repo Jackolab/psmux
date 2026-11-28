@@ -6500,7 +6500,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             .replace("#{client_activity}", &activity_secs.to_string())
                             .replace("#{client_session}", &app.session_name)
                             .replace("#{session_name}", &app.session_name)
-                            .replace("#{client_control_mode}", if ci.is_control { "1" } else { "0" });
+                            .replace("#{client_control_mode}", if ci.is_control { "1" } else { "0" })
+                            .replace("#{client_pid}", &ci.pid.map(|p| p.to_string()).unwrap_or_default());
                         output.push_str(&line);
                         output.push('\n');
                     }
@@ -7721,7 +7722,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::ControlRegister { client_id, echo, notif_tx } => {
+                CtrlReq::ControlRegister { client_id, echo, pid, notif_tx } => {
                     app.control_clients.insert(client_id, crate::types::ControlClient {
                         client_id,
                         cmd_counter: 0,
@@ -7740,6 +7741,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Register control clients with the same idempotent
                     // counter/registry invariant as normal TUI clients.
                     app.register_client(client_id, true);
+                    if let Some(ci) = app.client_registry.get_mut(&client_id) { ci.pid = pid; }
                     // Real tmux fires server hooks (session-changed, window-add,
                     // etc.) as side effects of the initial attach-session command.
                     // iTerm2 depends on %session-changed to enable writes
@@ -7792,8 +7794,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::ControlDeregister { client_id } => {
                     app.control_clients.remove(&client_id);
                     // Idempotent reap keeps the counter in lock-step with the
-                    // registry even if a control client is deregistered twice.
-                    app.reap_client(client_id);
+                    // registry even if a control client is deregistered twice;
+                    // only a real reap tells the other clients and runs the hook.
+                    if app.reap_client(client_id) {
+                        control::emit_notification(&app, crate::types::ControlNotification::ClientDetached {
+                            client: format!("/dev/pts/{}", client_id),
+                        });
+                        hook_event = Some("client-detached");
+                    }
                     if crate::resize_window::refresh_dynamic_window_sizes(&mut app) {
                         resize_all_panes(&mut app);
                         state_dirty = true;

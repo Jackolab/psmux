@@ -4453,7 +4453,10 @@ fn run_main() -> io::Result<()> {
             }
             // list-clients - List all clients
             "list-clients" | "lsc" => {
-                let resp = send_control_with_response("list-clients\n".to_string())?;
+                let mut cmd = "list-clients".to_string();
+                for a in &cmd_args[1..] { cmd.push(' '); cmd.push_str(&crate::util::quote_arg(a)); }
+                cmd.push('\n');
+                let resp = send_control_with_response(cmd)?;
                 print!("{}", resp);
                 return Ok(());
             }
@@ -5741,7 +5744,7 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     // Send CONTROL or CONTROL_NOECHO
     let mode_str = if mode == 1 { "CONTROL" } else { "CONTROL_NOECHO" };
     let mut write_stream = reader.get_ref().try_clone()?;
-    write!(write_stream, "{}\n", mode_str)?;
+    write!(write_stream, "{} {}\n", mode_str, std::process::id())?;
     write_stream.flush()?;
     cclog!("{} sent, starting I/O threads", mode_str);
 

@@ -109,6 +109,8 @@ pub struct ClientInfo {
     pub tty_name: String,
     /// True for CONTROL/CONTROL_NOECHO clients
     pub is_control: bool,
+    /// Process id the client reported on its handshake (control clients).
+    pub pid: Option<u32>,
     /// The session THIS client was in before it switched here, if any.
     ///
     /// psmux runs one server per session, so a switch tears the client off one
@@ -1796,6 +1798,7 @@ impl AppState {
             last_activity: std::time::Instant::now(),
             tty_name: tty,
             is_control,
+            pid: None,
             last_session: None,
         });
         self.attached_clients = self.attached_clients.saturating_add(1);
@@ -3315,6 +3318,7 @@ pub enum CtrlReq {
     ControlRegister {
         client_id: u64,
         echo: bool,
+        pid: Option<u32>,
         notif_tx: mpsc::SyncSender<ControlNotification>,
     },
     /// Deregister a control mode client.

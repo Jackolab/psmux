@@ -1072,8 +1072,11 @@ if line.trim() == "PERSISTENT" {
 }
 
 // Check for CONTROL or CONTROL_NOECHO (control mode)
-let control_echo = line.trim() == "CONTROL";
-let control_noecho = line.trim() == "CONTROL_NOECHO";
+let mut hello = line.split_whitespace();
+let mode_word = hello.next().unwrap_or("");
+let client_pid: Option<u32> = hello.next().and_then(|p| p.parse().ok());
+let control_echo = mode_word == "CONTROL";
+let control_noecho = mode_word == "CONTROL_NOECHO";
 if control_echo || control_noecho {
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
@@ -1151,6 +1154,7 @@ if control_echo || control_noecho {
     let _ = tx.send(CtrlReq::ControlRegister {
         client_id: ctrl_client_id,
         echo: control_echo,
+        pid: client_pid,
         notif_tx: notif_tx,
     });
 
